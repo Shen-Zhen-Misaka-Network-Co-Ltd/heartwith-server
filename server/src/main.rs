@@ -69,6 +69,18 @@ struct Collector {
     last_bpm: Option<i32>,
     last_seen_ms: Option<i64>,
     updated_at_ms: Option<i64>,
+    sleep_state: Option<String>,
+    sleep_observed_at_ms: Option<i64>,
+    sleep_bed_at_ms: Option<i64>,
+    sleep_at_ms: Option<i64>,
+    sleep_wake_at_ms: Option<i64>,
+    sleep_go_bed_at_ms: Option<i64>,
+    sleep_device_bed_at_ms: Option<i64>,
+    sleep_leave_bed_at_ms: Option<i64>,
+    sleep_device_wake_at_ms: Option<i64>,
+    sleep_duration_minutes: Option<i64>,
+    sleep_segments_json: Option<String>,
+    sleep_updated_at_ms: Option<i64>,
     seen_seqs: HashSet<u64>,
     seq_order: VecDeque<u64>,
     series: VecDeque<SeriesSample>,
@@ -127,6 +139,63 @@ struct BatchPayload {
     samples: Vec<RelativeSample>,
     #[serde(default)]
     ble: Option<serde_json::Value>,
+    #[serde(default)]
+    sleep: Option<SleepStatusPayload>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SleepStatusPayload {
+    state: String,
+    #[serde(default)]
+    observed_at_ms: Option<i64>,
+    #[serde(default)]
+    bed_at_ms: Option<i64>,
+    #[serde(default)]
+    sleep_at_ms: Option<i64>,
+    #[serde(default)]
+    wake_at_ms: Option<i64>,
+    #[serde(default)]
+    go_bed_at_ms: Option<i64>,
+    #[serde(default)]
+    device_bed_at_ms: Option<i64>,
+    #[serde(default)]
+    leave_bed_at_ms: Option<i64>,
+    #[serde(default)]
+    device_wake_at_ms: Option<i64>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    stable: Option<bool>,
+    #[serde(default)]
+    duration_minutes: Option<i64>,
+    #[serde(default)]
+    segments: Option<Vec<SleepSegmentPayload>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SleepSegmentPayload {
+    #[serde(default)]
+    bed_at_ms: Option<i64>,
+    #[serde(default)]
+    wake_at_ms: Option<i64>,
+    #[serde(default)]
+    device_bed_at_ms: Option<i64>,
+    #[serde(default)]
+    device_wake_at_ms: Option<i64>,
+    #[serde(default)]
+    duration_minutes: Option<i64>,
+    #[serde(default)]
+    deep_minutes: Option<i64>,
+    #[serde(default)]
+    light_minutes: Option<i64>,
+    #[serde(default)]
+    rem_minutes: Option<i64>,
+    #[serde(default)]
+    awake_minutes: Option<i64>,
+    #[serde(default)]
+    awake_count: Option<i64>,
+    #[serde(default)]
+    score: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -149,6 +218,23 @@ struct Participant {
     status: ParticipantStatus,
     last_bpm: Option<i32>,
     last_seen_ms: Option<i64>,
+    updated_at_ms: Option<i64>,
+    sleep: Option<ParticipantSleepStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ParticipantSleepStatus {
+    state: String,
+    observed_at_ms: Option<i64>,
+    bed_at_ms: Option<i64>,
+    sleep_at_ms: Option<i64>,
+    wake_at_ms: Option<i64>,
+    go_bed_at_ms: Option<i64>,
+    device_bed_at_ms: Option<i64>,
+    leave_bed_at_ms: Option<i64>,
+    device_wake_at_ms: Option<i64>,
+    duration_minutes: Option<i64>,
+    segments: Option<Vec<SleepSegmentPayload>>,
     updated_at_ms: Option<i64>,
 }
 
@@ -273,6 +359,22 @@ impl Db {
         )
         .execute(pool)
         .await?;
+        for column in [
+            "ALTER TABLE collectors ADD COLUMN sleep_state TEXT",
+            "ALTER TABLE collectors ADD COLUMN sleep_observed_at_ms INTEGER",
+            "ALTER TABLE collectors ADD COLUMN sleep_bed_at_ms INTEGER",
+            "ALTER TABLE collectors ADD COLUMN sleep_at_ms INTEGER",
+            "ALTER TABLE collectors ADD COLUMN sleep_wake_at_ms INTEGER",
+            "ALTER TABLE collectors ADD COLUMN sleep_go_bed_at_ms INTEGER",
+            "ALTER TABLE collectors ADD COLUMN sleep_device_bed_at_ms INTEGER",
+            "ALTER TABLE collectors ADD COLUMN sleep_leave_bed_at_ms INTEGER",
+            "ALTER TABLE collectors ADD COLUMN sleep_device_wake_at_ms INTEGER",
+            "ALTER TABLE collectors ADD COLUMN sleep_duration_minutes INTEGER",
+            "ALTER TABLE collectors ADD COLUMN sleep_segments_json TEXT",
+            "ALTER TABLE collectors ADD COLUMN sleep_updated_at_ms INTEGER",
+        ] {
+            ignore_duplicate_column(sqlx::query(column).execute(pool).await)?;
+        }
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS collector_seqs (
@@ -371,6 +473,22 @@ impl Db {
         )
         .execute(pool)
         .await?;
+        for column in [
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_state TEXT",
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_observed_at_ms BIGINT",
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_bed_at_ms BIGINT",
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_at_ms BIGINT",
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_wake_at_ms BIGINT",
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_go_bed_at_ms BIGINT",
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_device_bed_at_ms BIGINT",
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_leave_bed_at_ms BIGINT",
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_device_wake_at_ms BIGINT",
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_duration_minutes BIGINT",
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_segments_json TEXT",
+            "ALTER TABLE collectors ADD COLUMN IF NOT EXISTS sleep_updated_at_ms BIGINT",
+        ] {
+            sqlx::query(column).execute(pool).await?;
+        }
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS collector_seqs (
@@ -583,7 +701,11 @@ impl Db {
         let collectors = sqlx::query(
             r#"
             SELECT collector_id, display_name, device_model, client_platform, app_version,
-                   created_at_ms, last_bpm, last_seen_ms, updated_at_ms, token
+                   created_at_ms, last_bpm, last_seen_ms, updated_at_ms,
+                   sleep_state, sleep_observed_at_ms, sleep_bed_at_ms, sleep_at_ms,
+                   sleep_wake_at_ms, sleep_go_bed_at_ms, sleep_device_bed_at_ms,
+                   sleep_leave_bed_at_ms, sleep_device_wake_at_ms,
+                   sleep_duration_minutes, sleep_segments_json, sleep_updated_at_ms, token
             FROM collectors
             "#,
         )
@@ -608,6 +730,18 @@ impl Db {
                     last_bpm: row.get("last_bpm"),
                     last_seen_ms: row.get("last_seen_ms"),
                     updated_at_ms: row.get("updated_at_ms"),
+                    sleep_state: row.get("sleep_state"),
+                    sleep_observed_at_ms: row.get("sleep_observed_at_ms"),
+                    sleep_bed_at_ms: row.get("sleep_bed_at_ms"),
+                    sleep_at_ms: row.get("sleep_at_ms"),
+                    sleep_wake_at_ms: row.get("sleep_wake_at_ms"),
+                    sleep_go_bed_at_ms: row.get("sleep_go_bed_at_ms"),
+                    sleep_device_bed_at_ms: row.get("sleep_device_bed_at_ms"),
+                    sleep_leave_bed_at_ms: row.get("sleep_leave_bed_at_ms"),
+                    sleep_device_wake_at_ms: row.get("sleep_device_wake_at_ms"),
+                    sleep_duration_minutes: row.get("sleep_duration_minutes"),
+                    sleep_segments_json: row.get("sleep_segments_json"),
+                    sleep_updated_at_ms: row.get("sleep_updated_at_ms"),
                     seen_seqs: HashSet::new(),
                     seq_order: VecDeque::new(),
                     series: VecDeque::new(),
@@ -673,7 +807,11 @@ impl Db {
         let collectors = sqlx::query(
             r#"
             SELECT collector_id, display_name, device_model, client_platform, app_version,
-                   created_at_ms, last_bpm, last_seen_ms, updated_at_ms, token
+                   created_at_ms, last_bpm, last_seen_ms, updated_at_ms,
+                   sleep_state, sleep_observed_at_ms, sleep_bed_at_ms, sleep_at_ms,
+                   sleep_wake_at_ms, sleep_go_bed_at_ms, sleep_device_bed_at_ms,
+                   sleep_leave_bed_at_ms, sleep_device_wake_at_ms,
+                   sleep_duration_minutes, sleep_segments_json, sleep_updated_at_ms, token
             FROM collectors
             "#,
         )
@@ -698,6 +836,18 @@ impl Db {
                     last_bpm: row.get("last_bpm"),
                     last_seen_ms: row.get("last_seen_ms"),
                     updated_at_ms: row.get("updated_at_ms"),
+                    sleep_state: row.get("sleep_state"),
+                    sleep_observed_at_ms: row.get("sleep_observed_at_ms"),
+                    sleep_bed_at_ms: row.get("sleep_bed_at_ms"),
+                    sleep_at_ms: row.get("sleep_at_ms"),
+                    sleep_wake_at_ms: row.get("sleep_wake_at_ms"),
+                    sleep_go_bed_at_ms: row.get("sleep_go_bed_at_ms"),
+                    sleep_device_bed_at_ms: row.get("sleep_device_bed_at_ms"),
+                    sleep_leave_bed_at_ms: row.get("sleep_leave_bed_at_ms"),
+                    sleep_device_wake_at_ms: row.get("sleep_device_wake_at_ms"),
+                    sleep_duration_minutes: row.get("sleep_duration_minutes"),
+                    sleep_segments_json: row.get("sleep_segments_json"),
+                    sleep_updated_at_ms: row.get("sleep_updated_at_ms"),
                     seen_seqs: HashSet::new(),
                     seq_order: VecDeque::new(),
                     series: VecDeque::new(),
@@ -1065,7 +1215,11 @@ impl Db {
         sqlx::query(
             r#"
             UPDATE collectors
-            SET display_name = ?, device_model = ?, last_bpm = ?, last_seen_ms = ?, updated_at_ms = ?
+            SET display_name = ?, device_model = ?, last_bpm = ?, last_seen_ms = ?, updated_at_ms = ?,
+                sleep_state = ?, sleep_observed_at_ms = ?, sleep_bed_at_ms = ?,
+                sleep_at_ms = ?, sleep_wake_at_ms = ?, sleep_go_bed_at_ms = ?, sleep_device_bed_at_ms = ?,
+                sleep_leave_bed_at_ms = ?, sleep_device_wake_at_ms = ?,
+                sleep_duration_minutes = ?, sleep_segments_json = ?, sleep_updated_at_ms = ?
             WHERE collector_id = ?
             "#,
         )
@@ -1074,6 +1228,18 @@ impl Db {
         .bind(collector.last_bpm)
         .bind(collector.last_seen_ms)
         .bind(collector.updated_at_ms)
+        .bind(&collector.sleep_state)
+        .bind(collector.sleep_observed_at_ms)
+        .bind(collector.sleep_bed_at_ms)
+        .bind(collector.sleep_at_ms)
+        .bind(collector.sleep_wake_at_ms)
+        .bind(collector.sleep_go_bed_at_ms)
+        .bind(collector.sleep_device_bed_at_ms)
+        .bind(collector.sleep_leave_bed_at_ms)
+        .bind(collector.sleep_device_wake_at_ms)
+        .bind(collector.sleep_duration_minutes)
+        .bind(&collector.sleep_segments_json)
+        .bind(collector.sleep_updated_at_ms)
         .bind(&collector.collector_id)
         .execute(&mut *tx)
         .await?;
@@ -1170,8 +1336,12 @@ impl Db {
         sqlx::query(
             r#"
             UPDATE collectors
-            SET display_name = $1, device_model = $2, last_bpm = $3, last_seen_ms = $4, updated_at_ms = $5
-            WHERE collector_id = $6
+            SET display_name = $1, device_model = $2, last_bpm = $3, last_seen_ms = $4, updated_at_ms = $5,
+                sleep_state = $6, sleep_observed_at_ms = $7, sleep_bed_at_ms = $8,
+                sleep_at_ms = $9, sleep_wake_at_ms = $10, sleep_go_bed_at_ms = $11, sleep_device_bed_at_ms = $12,
+                sleep_leave_bed_at_ms = $13, sleep_device_wake_at_ms = $14,
+                sleep_duration_minutes = $15, sleep_segments_json = $16, sleep_updated_at_ms = $17
+            WHERE collector_id = $18
             "#,
         )
         .bind(&collector.display_name)
@@ -1179,6 +1349,18 @@ impl Db {
         .bind(collector.last_bpm)
         .bind(collector.last_seen_ms)
         .bind(collector.updated_at_ms)
+        .bind(&collector.sleep_state)
+        .bind(collector.sleep_observed_at_ms)
+        .bind(collector.sleep_bed_at_ms)
+        .bind(collector.sleep_at_ms)
+        .bind(collector.sleep_wake_at_ms)
+        .bind(collector.sleep_go_bed_at_ms)
+        .bind(collector.sleep_device_bed_at_ms)
+        .bind(collector.sleep_leave_bed_at_ms)
+        .bind(collector.sleep_device_wake_at_ms)
+        .bind(collector.sleep_duration_minutes)
+        .bind(&collector.sleep_segments_json)
+        .bind(collector.sleep_updated_at_ms)
         .bind(&collector.collector_id)
         .execute(&mut *tx)
         .await?;
@@ -1307,7 +1489,7 @@ async fn app_with_database(database_url: &str) -> anyhow::Result<Router> {
     let static_service = ServiceBuilder::new()
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("no-cache, max-age=0, must-revalidate"),
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
         ))
         .service(
             ServeDir::new(web_dir)
@@ -1316,6 +1498,9 @@ async fn app_with_database(database_url: &str) -> anyhow::Result<Router> {
         );
 
     let router = Router::new()
+        .route("/", get(index_html))
+        .route("/index.html", get(index_html))
+        .route("/heartwith.js", get(heartwith_js))
         .route("/api/v1/collector/sessions", post(create_session))
         .route("/api/v1/hr/batches", post(ingest_batch))
         .route("/api/v1/lobby/participants", get(lobby_participants))
@@ -1328,6 +1513,46 @@ async fn app_with_database(database_url: &str) -> anyhow::Result<Router> {
         .layer(CorsLayer::permissive())
         .with_state(state);
     Ok(router)
+}
+
+async fn index_html() -> impl IntoResponse {
+    match tokio::fs::read(web_dir().join("index.html")).await {
+        Ok(bytes) => (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/html; charset=utf-8"),
+                ),
+                (
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("no-cache, max-age=0, must-revalidate"),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn heartwith_js() -> impl IntoResponse {
+    match tokio::fs::read(web_dir().join("heartwith.js")).await {
+        Ok(bytes) => (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/javascript"),
+                ),
+                (
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("no-cache, max-age=0, must-revalidate"),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 fn web_dir() -> PathBuf {
@@ -1430,6 +1655,18 @@ async fn create_session(
         last_bpm: None,
         last_seen_ms: None,
         updated_at_ms: None,
+        sleep_state: None,
+        sleep_observed_at_ms: None,
+        sleep_bed_at_ms: None,
+        sleep_at_ms: None,
+        sleep_wake_at_ms: None,
+        sleep_go_bed_at_ms: None,
+        sleep_device_bed_at_ms: None,
+        sleep_leave_bed_at_ms: None,
+        sleep_device_wake_at_ms: None,
+        sleep_duration_minutes: None,
+        sleep_segments_json: None,
+        sleep_updated_at_ms: None,
         seen_seqs: HashSet::new(),
         seq_order: VecDeque::new(),
         series: VecDeque::new(),
@@ -1502,6 +1739,8 @@ async fn ingest_batch(
         };
         let mut accepted = 0;
         let mut latest_changed = false;
+        let mut sleep_changed = false;
+        let mut metadata_changed = false;
         let mut rejected_future_samples = 0usize;
         let mut max_future_offset_ms = 0i64;
 
@@ -1551,18 +1790,25 @@ async fn ingest_batch(
             }
         }
         if let Some(name) = payload.display_name {
-            collector.display_name = truncate(&name, 80);
+            let next = truncate(&name, 80);
+            metadata_changed |= collector.display_name != next;
+            collector.display_name = next;
         }
         if let Some(model) = payload.device_model {
-            collector.device_model = truncate(&model, 80);
+            let next = truncate(&model, 80);
+            metadata_changed |= collector.device_model != next;
+            collector.device_model = next;
+        }
+        if let Some(sleep) = payload.sleep {
+            sleep_changed = apply_sleep_status(collector, sleep, recv_ms);
         }
         collector.updated_at_ms = Some(recv_ms);
         trim_series(&mut collector.series, recv_ms);
 
-        if accepted > 0 && latest_changed {
+        if (accepted > 0 && latest_changed) || sleep_changed || metadata_changed {
             event_display_name = Some(collector.display_name.clone());
         }
-        if accepted > 0 {
+        if accepted > 0 || sleep_changed || metadata_changed {
             persist_collector = Some(collector.clone());
             persist_recv_ms = recv_ms;
         }
@@ -1682,6 +1928,138 @@ fn decode_payload(headers: &HeaderMap, bytes: &[u8]) -> Result<BatchPayload, Api
     }
 }
 
+fn apply_sleep_status(
+    collector: &mut Collector,
+    payload: SleepStatusPayload,
+    recv_ms: i64,
+) -> bool {
+    let Some(state) = normalize_sleep_state(&payload.state) else {
+        return false;
+    };
+    let observed_at_ms = sanitize_observed_ms(payload.observed_at_ms, recv_ms);
+    if collector
+        .sleep_observed_at_ms
+        .is_some_and(|existing| observed_at_ms < existing)
+    {
+        return false;
+    }
+    let go_bed_at_ms = sanitize_event_ms(payload.go_bed_at_ms, recv_ms);
+    let device_bed_at_ms = sanitize_event_ms(payload.device_bed_at_ms, recv_ms);
+    let leave_bed_at_ms = sanitize_event_ms(payload.leave_bed_at_ms, recv_ms);
+    let device_wake_at_ms = sanitize_event_ms(payload.device_wake_at_ms, recv_ms);
+    let bed_at_ms = go_bed_at_ms.or_else(|| sanitize_event_ms(payload.bed_at_ms, recv_ms));
+    let sleep_at_ms = device_bed_at_ms.or_else(|| sanitize_event_ms(payload.sleep_at_ms, recv_ms));
+    let wake_at_ms = device_wake_at_ms
+        .or_else(|| sanitize_event_ms(payload.wake_at_ms, recv_ms))
+        .or(leave_bed_at_ms);
+    let duration_minutes = payload.duration_minutes.filter(|value| *value > 0);
+    let sleep_segments_json = payload
+        .segments
+        .map(|segments| sanitize_sleep_segments(segments, recv_ms))
+        .map(|segments| {
+            if segments.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&segments).ok()
+            }
+        })
+        .flatten();
+    let segments_changed = sleep_segments_json
+        .as_ref()
+        .is_some_and(|segments| collector.sleep_segments_json.as_ref() != Some(segments));
+    let changed = collector.sleep_state.as_deref() != Some(state)
+        || collector.sleep_observed_at_ms != Some(observed_at_ms)
+        || collector.sleep_bed_at_ms != bed_at_ms
+        || collector.sleep_at_ms != sleep_at_ms
+        || collector.sleep_wake_at_ms != wake_at_ms
+        || collector.sleep_go_bed_at_ms != go_bed_at_ms
+        || collector.sleep_device_bed_at_ms != device_bed_at_ms
+        || collector.sleep_leave_bed_at_ms != leave_bed_at_ms
+        || collector.sleep_device_wake_at_ms != device_wake_at_ms
+        || collector.sleep_duration_minutes != duration_minutes
+        || segments_changed;
+    collector.sleep_state = Some(state.to_string());
+    collector.sleep_observed_at_ms = Some(observed_at_ms);
+    collector.sleep_bed_at_ms = bed_at_ms;
+    collector.sleep_at_ms = sleep_at_ms;
+    collector.sleep_wake_at_ms = wake_at_ms;
+    collector.sleep_go_bed_at_ms = go_bed_at_ms;
+    collector.sleep_device_bed_at_ms = device_bed_at_ms;
+    collector.sleep_leave_bed_at_ms = leave_bed_at_ms;
+    collector.sleep_device_wake_at_ms = device_wake_at_ms;
+    collector.sleep_duration_minutes = duration_minutes;
+    if sleep_segments_json.is_some() {
+        collector.sleep_segments_json = sleep_segments_json;
+    }
+    collector.sleep_updated_at_ms = Some(recv_ms);
+    changed
+}
+
+fn normalize_sleep_state(state: &str) -> Option<&'static str> {
+    match state {
+        "in_bed" => Some("in_bed"),
+        "asleep" => Some("asleep"),
+        "awake" | "awake_in_bed" => Some("awake"),
+        _ => None,
+    }
+}
+
+fn sanitize_observed_ms(observed_at_ms: Option<i64>, recv_ms: i64) -> i64 {
+    let value = observed_at_ms.unwrap_or(recv_ms);
+    if value <= 0 || value > recv_ms + MAX_SAMPLE_FUTURE_MS {
+        recv_ms
+    } else {
+        value
+    }
+}
+
+fn sanitize_event_ms(value: Option<i64>, recv_ms: i64) -> Option<i64> {
+    let value = value?;
+    if value <= 0 {
+        return None;
+    }
+    Some(value.min(recv_ms + MAX_SAMPLE_FUTURE_MS))
+}
+
+fn sanitize_sleep_segments(
+    segments: Vec<SleepSegmentPayload>,
+    recv_ms: i64,
+) -> Vec<SleepSegmentPayload> {
+    segments
+        .into_iter()
+        .filter_map(|segment| {
+            let sanitized = SleepSegmentPayload {
+                bed_at_ms: sanitize_event_ms(segment.bed_at_ms, recv_ms),
+                wake_at_ms: sanitize_event_ms(segment.wake_at_ms, recv_ms),
+                device_bed_at_ms: sanitize_event_ms(segment.device_bed_at_ms, recv_ms),
+                device_wake_at_ms: sanitize_event_ms(segment.device_wake_at_ms, recv_ms),
+                duration_minutes: positive_i64(segment.duration_minutes),
+                deep_minutes: positive_i64(segment.deep_minutes),
+                light_minutes: positive_i64(segment.light_minutes),
+                rem_minutes: positive_i64(segment.rem_minutes),
+                awake_minutes: positive_i64(segment.awake_minutes),
+                awake_count: positive_i64(segment.awake_count),
+                score: positive_i64(segment.score),
+            };
+            if sanitized.bed_at_ms.is_some()
+                || sanitized.wake_at_ms.is_some()
+                || sanitized.device_bed_at_ms.is_some()
+                || sanitized.device_wake_at_ms.is_some()
+                || sanitized.duration_minutes.is_some()
+            {
+                Some(sanitized)
+            } else {
+                None
+            }
+        })
+        .take(16)
+        .collect()
+}
+
+fn positive_i64(value: Option<i64>) -> Option<i64> {
+    value.filter(|item| *item > 0)
+}
+
 fn participant_for(collector: &Collector, current_ms: i64) -> Participant {
     let display_last_seen_ms =
         effective_last_seen_ms(collector.last_seen_ms, collector.updated_at_ms, current_ms);
@@ -1693,6 +2071,26 @@ fn participant_for(collector: &Collector, current_ms: i64) -> Participant {
         last_bpm: collector.last_bpm,
         last_seen_ms: display_last_seen_ms,
         updated_at_ms: collector.updated_at_ms,
+        sleep: collector
+            .sleep_state
+            .as_ref()
+            .map(|state| ParticipantSleepStatus {
+                state: state.clone(),
+                observed_at_ms: collector.sleep_observed_at_ms,
+                bed_at_ms: collector.sleep_bed_at_ms,
+                sleep_at_ms: collector.sleep_at_ms,
+                wake_at_ms: collector.sleep_wake_at_ms,
+                go_bed_at_ms: collector.sleep_go_bed_at_ms,
+                device_bed_at_ms: collector.sleep_device_bed_at_ms,
+                leave_bed_at_ms: collector.sleep_leave_bed_at_ms,
+                device_wake_at_ms: collector.sleep_device_wake_at_ms,
+                duration_minutes: collector.sleep_duration_minutes,
+                segments: collector
+                    .sleep_segments_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str(value).ok()),
+                updated_at_ms: collector.sleep_updated_at_ms,
+            }),
     }
 }
 
@@ -1731,11 +2129,9 @@ fn reconcile_loaded_latest(store: &mut Store, current_ms: i64) {
 
 fn aggregate_participants(store: &Store, current_ms: i64) -> Vec<Participant> {
     let mut by_name: HashMap<String, Participant> = HashMap::new();
-    for collector in store
-        .collectors
-        .values()
-        .filter(|collector| collector.last_seen_ms.is_some())
-    {
+    for collector in store.collectors.values().filter(|collector| {
+        collector.last_seen_ms.is_some() || collector.sleep_updated_at_ms.is_some()
+    }) {
         let participant = participant_for(collector, current_ms);
         by_name
             .entry(participant.display_name.clone())
@@ -1764,7 +2160,8 @@ fn aggregate_participant_for_name(
         .collectors
         .values()
         .filter(|collector| {
-            collector.last_seen_ms.is_some() && collector.display_name == display_name
+            (collector.last_seen_ms.is_some() || collector.sleep_updated_at_ms.is_some())
+                && collector.display_name == display_name
         })
         .map(|collector| participant_for(collector, current_ms))
         .max_by(|left, right| participant_sort_key(left).cmp(&participant_sort_key(right)))
@@ -1774,9 +2171,14 @@ fn participant_is_newer(candidate: &Participant, current: &Participant) -> bool 
     participant_sort_key(candidate) > participant_sort_key(current)
 }
 
-fn participant_sort_key(participant: &Participant) -> (i64, i64) {
+fn participant_sort_key(participant: &Participant) -> (i64, i64, i64) {
     (
         participant.last_seen_ms.unwrap_or_default(),
+        participant
+            .sleep
+            .as_ref()
+            .and_then(|sleep| sleep.observed_at_ms)
+            .unwrap_or_default(),
         participant.updated_at_ms.unwrap_or_default(),
     )
 }
@@ -1820,23 +2222,151 @@ fn trim_series(series: &mut VecDeque<SeriesSample>, current_ms: i64) {
 }
 
 fn public_base_url(headers: &HeaderMap) -> String {
-    if let Some(value) = headers
-        .get("x-forwarded-host")
-        .and_then(|value| value.to_str().ok())
+    public_base_url_from_headers(headers)
+}
+
+fn public_base_url_from_headers(headers: &HeaderMap) -> String {
+    let forwarded = headers
+        .get("forwarded")
+        .and_then(|value| value.to_str().ok());
+    let host = forwarded
+        .and_then(|value| forwarded_header_value(value, "host"))
+        .or_else(|| first_header_value(headers, "x-forwarded-host"))
+        .or_else(|| first_header_value(headers, header::HOST.as_str()));
+    let Some(host) = host.map(clean_host).filter(|value| !value.is_empty()) else {
+        return "http://127.0.0.1:8000".to_string();
+    };
+    let proto = public_scheme(headers, forwarded, host);
+    format!("{proto}://{host}")
+}
+
+fn public_scheme<'a>(
+    headers: &'a HeaderMap,
+    forwarded: Option<&'a str>,
+    host: &str,
+) -> &'static str {
+    if let Some(proto) = forwarded
+        .and_then(|value| forwarded_header_value(value, "proto"))
+        .or_else(|| first_header_value(headers, "x-forwarded-proto"))
+        .or_else(|| first_header_value(headers, "x-forwarded-scheme"))
+        .or_else(|| first_header_value(headers, "x-url-scheme"))
+        .or_else(|| first_header_value(headers, "x-scheme"))
+        .and_then(normalize_scheme)
     {
-        let proto = headers
-            .get("x-forwarded-proto")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("https");
-        return format!("{proto}://{value}");
+        return proto;
     }
-    if let Some(value) = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
+    if first_header_value(headers, "x-forwarded-ssl")
+        .or_else(|| first_header_value(headers, "front-end-https"))
+        .is_some_and(is_truthy_header)
     {
-        return format!("http://{value}");
+        return "https";
     }
-    "http://127.0.0.1:8000".to_string()
+    if let Some(scheme) = first_header_value(headers, "cf-visitor").and_then(cf_visitor_scheme) {
+        return scheme;
+    }
+    match first_header_value(headers, "x-forwarded-port") {
+        Some("443") => "https",
+        Some("80") => "http",
+        _ if host_default_scheme_is_http(host) => "http",
+        _ => "https",
+    }
+}
+
+fn first_header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn forwarded_header_value<'a>(header_value: &'a str, key: &str) -> Option<&'a str> {
+    let first_forwarded = header_value.split(',').next()?.trim();
+    for part in first_forwarded.split(';') {
+        let (name, value) = part.trim().split_once('=')?;
+        if name.trim().eq_ignore_ascii_case(key) {
+            return Some(value.trim().trim_matches('"'));
+        }
+    }
+    None
+}
+
+fn clean_host(host: &str) -> &str {
+    host.trim().trim_matches('"').trim_end_matches('/')
+}
+
+fn host_default_scheme_is_http(host: &str) -> bool {
+    if host_is_local(host) {
+        return true;
+    }
+    matches!(explicit_host_port(host), Some(80 | 8000 | 8080))
+}
+
+fn explicit_host_port(host: &str) -> Option<u16> {
+    if host.starts_with('[') {
+        let (_, rest) = host.split_once(']')?;
+        return rest.strip_prefix(':')?.parse().ok();
+    }
+    let mut parts = host.rsplitn(2, ':');
+    let port = parts.next()?;
+    let hostname = parts.next()?;
+    if hostname.contains(':') {
+        return None;
+    }
+    port.parse().ok()
+}
+
+fn normalize_scheme(value: &str) -> Option<&'static str> {
+    match value.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+        "https" => Some("https"),
+        "http" => Some("http"),
+        _ => None,
+    }
+}
+
+fn is_truthy_header(value: &str) -> bool {
+    matches!(
+        value.trim().trim_matches('"').to_ascii_lowercase().as_str(),
+        "on" | "true" | "1" | "https"
+    )
+}
+
+fn cf_visitor_scheme(value: &str) -> Option<&'static str> {
+    let value = value.trim();
+    if value.contains(r#""scheme":"https""#) || value.contains(r#""scheme": "https""#) {
+        Some("https")
+    } else if value.contains(r#""scheme":"http""#) || value.contains(r#""scheme": "http""#) {
+        Some("http")
+    } else {
+        None
+    }
+}
+
+fn host_is_local(host: &str) -> bool {
+    let host_without_port = host
+        .strip_prefix('[')
+        .and_then(|value| value.split_once(']').map(|(ipv6, _)| ipv6))
+        .or_else(|| host.split_once(':').map(|(hostname, _)| hostname))
+        .unwrap_or(host);
+    host_without_port.eq_ignore_ascii_case("localhost")
+        || host_without_port == "127.0.0.1"
+        || host_without_port == "::1"
+        || host_without_port.starts_with("10.")
+        || host_without_port.starts_with("192.168.")
+        || is_private_172_host(host_without_port)
+}
+
+fn is_private_172_host(host: &str) -> bool {
+    let Some(second) = host
+        .strip_prefix("172.")
+        .and_then(|rest| rest.split('.').next())
+    else {
+        return false;
+    };
+    second
+        .parse::<u8>()
+        .is_ok_and(|value| (16..=31).contains(&value))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -2005,6 +2535,78 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    #[test]
+    fn public_base_url_reads_standard_forwarded_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            "for=192.0.2.60;proto=https;host=heart.op.wiki"
+                .parse()
+                .unwrap(),
+        );
+
+        assert_eq!(
+            public_base_url_from_headers(&headers),
+            "https://heart.op.wiki"
+        );
+    }
+
+    #[test]
+    fn public_base_url_keeps_http_for_plain_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:8000".parse().unwrap());
+
+        assert_eq!(
+            public_base_url_from_headers(&headers),
+            "http://127.0.0.1:8000"
+        );
+    }
+
+    #[test]
+    fn public_base_url_treats_public_host_as_https_without_proxy_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "heart.op.wiki".parse().unwrap());
+
+        assert_eq!(
+            public_base_url_from_headers(&headers),
+            "https://heart.op.wiki"
+        );
+    }
+
+    #[test]
+    fn public_base_url_reads_cf_visitor_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "heart.op.wiki".parse().unwrap());
+        headers.insert("cf-visitor", r#"{"scheme":"https"}"#.parse().unwrap());
+
+        assert_eq!(
+            public_base_url_from_headers(&headers),
+            "https://heart.op.wiki"
+        );
+    }
+
+    #[test]
+    fn public_base_url_keeps_http_for_lan_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "192.168.1.22:8000".parse().unwrap());
+
+        assert_eq!(
+            public_base_url_from_headers(&headers),
+            "http://192.168.1.22:8000"
+        );
+    }
+
+    #[test]
+    fn public_base_url_keeps_http_for_direct_origin_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "52.193.131.172:8000".parse().unwrap());
+
+        assert_eq!(
+            public_base_url_from_headers(&headers),
+            "http://52.193.131.172:8000"
+        );
+    }
+
     async fn post_batch(
         app: Router,
         session: &SessionResponse,
@@ -2045,6 +2647,7 @@ mod tests {
             device_model: Some("Mi Band".to_string()),
             samples: vec![RelativeSample { dt_ms: 0, bpm: 82 }],
             ble: None,
+            sleep: None,
         };
         let ingest = post_batch(app.clone(), &session, &payload).await;
         assert_eq!(ingest.accepted, 1);
@@ -2053,6 +2656,7 @@ mod tests {
         assert_eq!(duplicate.accepted, 0);
 
         let lobby_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -2086,6 +2690,7 @@ mod tests {
             device_model: Some("Mi Band".to_string()),
             samples: vec![RelativeSample { dt_ms: 0, bpm: 82 }],
             ble: None,
+            sleep: None,
         };
         assert_eq!(
             post_batch(app.clone(), &first_session, &first_payload)
@@ -2110,6 +2715,7 @@ mod tests {
             device_model: Some("Mi Band".to_string()),
             samples: vec![RelativeSample { dt_ms: 0, bpm: 88 }],
             ble: None,
+            sleep: None,
         };
         assert_eq!(
             post_batch(app.clone(), &second_session, &second_payload)
@@ -2119,6 +2725,7 @@ mod tests {
         );
 
         let lobby_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -2158,6 +2765,7 @@ mod tests {
                 RelativeSample { dt_ms: 0, bpm: 241 },
             ],
             ble: None,
+            sleep: None,
         };
         assert_eq!(post_batch(app.clone(), &session, &first).await.accepted, 1);
 
@@ -2170,6 +2778,7 @@ mod tests {
             device_model: None,
             samples: vec![RelativeSample { dt_ms: 0, bpm: 50 }],
             ble: None,
+            sleep: None,
         };
         assert_eq!(post_batch(app.clone(), &session, &older).await.accepted, 1);
 
@@ -2213,6 +2822,7 @@ mod tests {
                 RelativeSample { dt_ms: 0, bpm: 100 },
             ],
             ble: None,
+            sleep: None,
         };
         assert_eq!(
             post_batch(app.clone(), &session, &payload).await.accepted,
@@ -2263,6 +2873,7 @@ mod tests {
                 bpm: 88,
             }],
             ble: None,
+            sleep: None,
         };
         assert_eq!(
             post_batch(app.clone(), &session, &payload).await.accepted,
@@ -2290,6 +2901,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sleep_status_only_batch_updates_lobby_compatibly() {
+        let app = test_app().await;
+        let session = create_test_session(app.clone()).await;
+        let current_ms = now_ms();
+        let payload = BatchPayload {
+            schema: 1,
+            collector_id: session.collector_id.clone(),
+            seq: 1,
+            sent_at_ms: current_ms,
+            display_name: Some("Allen".to_string()),
+            device_model: Some("Mi Band".to_string()),
+            samples: vec![],
+            ble: None,
+            sleep: Some(SleepStatusPayload {
+                state: "asleep".to_string(),
+                observed_at_ms: Some(current_ms),
+                bed_at_ms: Some(current_ms - 20 * 60_000),
+                sleep_at_ms: Some(current_ms - 15 * 60_000),
+                wake_at_ms: None,
+                go_bed_at_ms: Some(current_ms - 25 * 60_000),
+                device_bed_at_ms: Some(current_ms - 15 * 60_000),
+                leave_bed_at_ms: None,
+                device_wake_at_ms: None,
+                source: Some("test".to_string()),
+                stable: Some(false),
+                duration_minutes: Some(15),
+                segments: None,
+            }),
+        };
+        assert_eq!(
+            post_batch(app.clone(), &session, &payload).await.accepted,
+            0
+        );
+
+        let lobby_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/lobby/participants")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = lobby_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let lobby: LobbyResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(lobby.participants.len(), 1);
+        let sleep = lobby.participants[0].sleep.as_ref().unwrap();
+        assert_eq!(sleep.state, "asleep");
+        assert_eq!(sleep.bed_at_ms, Some(current_ms - 25 * 60_000));
+        assert_eq!(sleep.go_bed_at_ms, Some(current_ms - 25 * 60_000));
+        assert_eq!(sleep.device_bed_at_ms, Some(current_ms - 15 * 60_000));
+        assert_eq!(sleep.sleep_at_ms, Some(current_ms - 15 * 60_000));
+        assert_eq!(sleep.duration_minutes, Some(15));
+
+        let awake_payload = BatchPayload {
+            seq: 2,
+            sleep: Some(SleepStatusPayload {
+                state: "awake_in_bed".to_string(),
+                observed_at_ms: Some(current_ms + 60_000),
+                bed_at_ms: Some(current_ms - 40 * 60_000),
+                sleep_at_ms: Some(current_ms - 35 * 60_000),
+                wake_at_ms: Some(current_ms - 60_000),
+                go_bed_at_ms: Some(current_ms - 45 * 60_000),
+                device_bed_at_ms: Some(current_ms - 35 * 60_000),
+                leave_bed_at_ms: Some(current_ms - 30_000),
+                device_wake_at_ms: Some(current_ms - 60_000),
+                source: Some("test".to_string()),
+                stable: Some(true),
+                duration_minutes: Some(34),
+                segments: Some(vec![
+                    SleepSegmentPayload {
+                        bed_at_ms: Some(current_ms - 35 * 60_000),
+                        wake_at_ms: Some(current_ms - 20 * 60_000),
+                        device_bed_at_ms: Some(current_ms - 35 * 60_000),
+                        device_wake_at_ms: Some(current_ms - 20 * 60_000),
+                        duration_minutes: Some(15),
+                        deep_minutes: None,
+                        light_minutes: None,
+                        rem_minutes: None,
+                        awake_minutes: None,
+                        awake_count: None,
+                        score: None,
+                    },
+                    SleepSegmentPayload {
+                        bed_at_ms: Some(current_ms - 18 * 60_000),
+                        wake_at_ms: Some(current_ms - 60_000),
+                        device_bed_at_ms: Some(current_ms - 18 * 60_000),
+                        device_wake_at_ms: Some(current_ms - 60_000),
+                        duration_minutes: Some(17),
+                        deep_minutes: None,
+                        light_minutes: None,
+                        rem_minutes: None,
+                        awake_minutes: None,
+                        awake_count: None,
+                        score: None,
+                    },
+                ]),
+            }),
+            ..payload
+        };
+        assert_eq!(
+            post_batch(app.clone(), &session, &awake_payload)
+                .await
+                .accepted,
+            0
+        );
+        let lobby_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/lobby/participants")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = lobby_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let lobby: LobbyResponse = serde_json::from_slice(&bytes).unwrap();
+        let sleep = lobby.participants[0].sleep.as_ref().unwrap();
+        assert_eq!(sleep.state, "awake");
+        assert_eq!(sleep.wake_at_ms, Some(current_ms - 60_000));
+        assert_eq!(sleep.duration_minutes, Some(34));
+        assert_eq!(sleep.segments.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[tokio::test]
     async fn database_persists_lobby_and_series_across_restart() {
         let (app, database_url) = test_app_with_url().await;
         let session = create_test_session(app.clone()).await;
@@ -2309,6 +3058,7 @@ mod tests {
                 RelativeSample { dt_ms: 0, bpm: 82 },
             ],
             ble: None,
+            sleep: None,
         };
         assert_eq!(post_batch(app, &session, &payload).await.accepted, 2);
 
@@ -2479,6 +3229,18 @@ mod tests {
                 last_bpm: Some(90),
                 last_seen_ms: Some(current_ms + 60 * 60_000),
                 updated_at_ms: Some(current_ms - 60_000),
+                sleep_state: None,
+                sleep_observed_at_ms: None,
+                sleep_bed_at_ms: None,
+                sleep_at_ms: None,
+                sleep_wake_at_ms: None,
+                sleep_go_bed_at_ms: None,
+                sleep_device_bed_at_ms: None,
+                sleep_leave_bed_at_ms: None,
+                sleep_device_wake_at_ms: None,
+                sleep_duration_minutes: None,
+                sleep_segments_json: None,
+                sleep_updated_at_ms: None,
                 seen_seqs: HashSet::new(),
                 seq_order: VecDeque::new(),
                 series: VecDeque::from(vec![SeriesSample {
