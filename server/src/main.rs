@@ -1949,9 +1949,13 @@ fn apply_sleep_status(
     let device_wake_at_ms = sanitize_event_ms(payload.device_wake_at_ms, recv_ms);
     let bed_at_ms = go_bed_at_ms.or_else(|| sanitize_event_ms(payload.bed_at_ms, recv_ms));
     let sleep_at_ms = device_bed_at_ms.or_else(|| sanitize_event_ms(payload.sleep_at_ms, recv_ms));
-    let wake_at_ms = device_wake_at_ms
-        .or_else(|| sanitize_event_ms(payload.wake_at_ms, recv_ms))
-        .or(leave_bed_at_ms);
+    let wake_at_ms = if state == "awake" {
+        device_wake_at_ms
+            .or_else(|| sanitize_event_ms(payload.wake_at_ms, recv_ms))
+            .or(leave_bed_at_ms)
+    } else {
+        None
+    };
     let duration_minutes = payload.duration_minutes.filter(|value| *value > 0);
     let sleep_segments_json = payload
         .segments
@@ -2923,7 +2927,7 @@ mod tests {
                 go_bed_at_ms: Some(current_ms - 25 * 60_000),
                 device_bed_at_ms: Some(current_ms - 15 * 60_000),
                 leave_bed_at_ms: None,
-                device_wake_at_ms: None,
+                device_wake_at_ms: Some(current_ms),
                 source: Some("test".to_string()),
                 stable: Some(false),
                 duration_minutes: Some(15),
@@ -2960,6 +2964,8 @@ mod tests {
         assert_eq!(sleep.go_bed_at_ms, Some(current_ms - 25 * 60_000));
         assert_eq!(sleep.device_bed_at_ms, Some(current_ms - 15 * 60_000));
         assert_eq!(sleep.sleep_at_ms, Some(current_ms - 15 * 60_000));
+        assert_eq!(sleep.wake_at_ms, None);
+        assert_eq!(sleep.device_wake_at_ms, Some(current_ms));
         assert_eq!(sleep.duration_minutes, Some(15));
 
         let awake_payload = BatchPayload {
