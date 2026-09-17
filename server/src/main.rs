@@ -1426,16 +1426,9 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         }
-        sqlx::query("DELETE FROM heart_rate_samples WHERE collector_id = $1 AND t_ms < $2")
-            .bind(&collector.collector_id)
-            .bind(recv_ms - RAW_SAMPLE_TTL_MS)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM heart_rate_rollups WHERE collector_id = $1 AND bucket_ms < $2")
-            .bind(&collector.collector_id)
-            .bind(recv_ms - ROLLUP_TTL_MS)
-            .execute(&mut *tx)
-            .await?;
+        // The retention sweeper owns expiry. A per-batch DELETE on a hypertable
+        // locks historical chunks and can exhaust the shared lock table before
+        // this ingest transaction commits, even when no rows need removal.
         sqlx::query(
             r#"
             DELETE FROM collector_seqs
