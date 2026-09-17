@@ -601,14 +601,7 @@ impl Db {
             FROM heart_rate_samples
             WHERE true
             GROUP BY 1, 2
-            ON CONFLICT(collector_id, bucket_ms) DO UPDATE SET
-                sample_count = excluded.sample_count,
-                bpm_sum = excluded.bpm_sum,
-                bpm_sum_sq = excluded.bpm_sum_sq,
-                min_bpm = excluded.min_bpm,
-                max_bpm = excluded.max_bpm,
-                first_t_ms = excluded.first_t_ms,
-                last_t_ms = excluded.last_t_ms
+            ON CONFLICT(collector_id, bucket_ms) DO NOTHING
             "#,
         )
         .bind(ROLLUP_BUCKET_MS)
@@ -637,14 +630,7 @@ impl Db {
                 MAX(t_ms) AS last_t_ms
             FROM heart_rate_samples
             GROUP BY 1, 2
-            ON CONFLICT(collector_id, bucket_ms) DO UPDATE SET
-                sample_count = excluded.sample_count,
-                bpm_sum = excluded.bpm_sum,
-                bpm_sum_sq = excluded.bpm_sum_sq,
-                min_bpm = excluded.min_bpm,
-                max_bpm = excluded.max_bpm,
-                first_t_ms = excluded.first_t_ms,
-                last_t_ms = excluded.last_t_ms
+            ON CONFLICT(collector_id, bucket_ms) DO NOTHING
             "#,
         )
         .bind(ROLLUP_BUCKET_MS)
