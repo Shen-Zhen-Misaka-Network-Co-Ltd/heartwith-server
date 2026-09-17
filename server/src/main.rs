@@ -291,6 +291,7 @@ struct SeriesResponse {
 #[derive(Clone)]
 struct Db {
     pool: DbPool,
+    native_raw_retention: bool,
 }
 
 #[derive(Clone)]
@@ -321,9 +322,13 @@ impl Db {
                     .await?,
             )
         };
-        let db = Self { pool };
+        let mut db = Self {
+            pool,
+            native_raw_retention: false,
+        };
         db.migrate().await?;
         db.backfill_rollups_from_raw().await?;
+        db.native_raw_retention = db.configure_raw_retention().await?;
         db.prune_expired(now_ms()).await?;
         Ok(db)
     }
@@ -639,6 +644,58 @@ impl Db {
         Ok(())
     }
 
+    async fn configure_raw_retention(&self) -> anyhow::Result<bool> {
+        let DbPool::Postgres(pool) = &self.pool else {
+            return Ok(false);
+        };
+        let has_timescale: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')",
+        )
+        .fetch_one(pool)
+        .await?;
+        if !has_timescale {
+            return Ok(false);
+        }
+        let is_hypertable: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_schema = 'public' AND hypertable_name = 'heart_rate_samples')",
+        ).fetch_one(pool).await?;
+        if !is_hypertable {
+            return Ok(false);
+        }
+
+        // Configure only after backfill; a native job must never prune legacy
+        // samples before their rollups exist. Keep this idempotent on restart.
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '3s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout = '30s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(728143902)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION public.heartwith_now_ms() RETURNS BIGINT LANGUAGE SQL STABLE AS $$ SELECT floor(extract(epoch FROM now()) * 1000)::bigint $$",
+        ).execute(&mut *tx).await?;
+        sqlx::query("SELECT set_integer_now_func('public.heart_rate_samples'::regclass, 'public.heartwith_now_ms'::regproc, replace_if_exists => true)")
+            .execute(&mut *tx).await?;
+        sqlx::query("SELECT add_retention_policy('public.heart_rate_samples'::regclass, drop_after => $1::bigint, schedule_interval => INTERVAL '15 minutes', initial_start => now(), if_not_exists => true)")
+            .bind(RAW_SAMPLE_TTL_MS).execute(&mut *tx).await?;
+        let job = sqlx::query("SELECT job_id, (config->>'drop_after')::bigint AS ttl_ms FROM timescaledb_information.jobs WHERE hypertable_schema = 'public' AND hypertable_name = 'heart_rate_samples' AND proc_name = 'policy_retention'")
+            .fetch_one(&mut *tx).await?;
+        anyhow::ensure!(
+            job.get::<i64, _>("ttl_ms") == RAW_SAMPLE_TTL_MS,
+            "existing raw retention policy differs from the 24-hour contract"
+        );
+        let job_id: i32 = job.get("job_id");
+        sqlx::query("SELECT alter_job($1, schedule_interval => INTERVAL '15 minutes', max_runtime => INTERVAL '2 minutes', retry_period => INTERVAL '15 minutes', scheduled => true)")
+            .bind(job_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        tracing::info!(job_id, "native raw chunk retention enabled");
+        Ok(true)
+    }
+
     async fn prune_expired(&self, current_ms: i64) -> anyhow::Result<()> {
         match &self.pool {
             DbPool::Sqlite(pool) => {
@@ -652,14 +709,32 @@ impl Db {
                     .await?;
             }
             DbPool::Postgres(pool) => {
-                sqlx::query("DELETE FROM heart_rate_samples WHERE t_ms < $1")
-                    .bind(current_ms - RAW_SAMPLE_TTL_MS)
-                    .execute(pool)
-                    .await?;
+                if !self.native_raw_retention {
+                    sqlx::query("DELETE FROM heart_rate_samples WHERE t_ms < $1")
+                        .bind(current_ms - RAW_SAMPLE_TTL_MS)
+                        .execute(pool)
+                        .await?;
+                }
                 sqlx::query("DELETE FROM heart_rate_rollups WHERE bucket_ms < $1")
                     .bind(current_ms - ROLLUP_TTL_MS)
                     .execute(pool)
                     .await?;
+                if self.native_raw_retention {
+                    let chunks: i64 = sqlx::query_scalar("SELECT count(*) FROM timescaledb_information.chunks WHERE hypertable_schema='public' AND hypertable_name='heart_rate_samples'")
+                        .fetch_one(pool).await?;
+                    let job = sqlx::query("SELECT j.scheduled, s.last_run_status, COALESCE(COALESCE(s.last_successful_finish, j.initial_start) < now() - INTERVAL '1 hour', true) AS overdue FROM timescaledb_information.jobs j LEFT JOIN timescaledb_information.job_stats s USING (job_id) WHERE j.hypertable_schema='public' AND j.hypertable_name='heart_rate_samples' AND j.proc_name='policy_retention'")
+                        .fetch_optional(pool).await?;
+                    let healthy = job.as_ref().is_some_and(|row| {
+                        row.get::<bool, _>("scheduled")
+                            && !row.get::<bool, _>("overdue")
+                            && row
+                                .get::<Option<String>, _>("last_run_status")
+                                .is_none_or(|status| status == "Success")
+                    });
+                    if chunks > 48 || !healthy {
+                        tracing::warn!(chunks, healthy, "raw retention needs attention: check TimescaleDB jobs and lock capacity");
+                    }
+                }
             }
         }
         Ok(())
@@ -3300,6 +3375,104 @@ mod tests {
         .unwrap();
         assert_eq!(rollup_count, 3);
         pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable TimescaleDB database in HEARTWITH_RETENTION_TEST_URL"]
+    async fn timescale_retention_drops_chunks_but_keeps_recent_samples_and_rollups() {
+        let url = std::env::var("HEARTWITH_RETENTION_TEST_URL").unwrap();
+        let app = app_with_database(&url).await.unwrap();
+        let session = create_test_session(app).await;
+        let db = Db::connect(&url).await.unwrap();
+        assert!(db.native_raw_retention);
+        let DbPool::Postgres(pool) = &db.pool else {
+            panic!("PostgreSQL required")
+        };
+        let job_id: i32 = sqlx::query_scalar("SELECT job_id FROM timescaledb_information.jobs WHERE hypertable_name = 'heart_rate_samples' AND proc_name = 'policy_retention'")
+            .fetch_one(pool).await.unwrap();
+        sqlx::query("SELECT alter_job($1, scheduled => false)")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let now = now_ms();
+        let old = now - 48 * 3_600_000;
+        let boundary = rollup_bucket(now - RAW_SAMPLE_TTL_MS) + 1;
+        for (time, bpm) in [(old, 70), (boundary, 75), (now, 80)] {
+            sqlx::query("INSERT INTO heart_rate_samples (collector_id,t_ms,bpm,seq,received_at_ms) VALUES ($1,$2,$3,1,$2)")
+                .bind(&session.collector_id).bind(time).bind(bpm).execute(pool).await.unwrap();
+        }
+        db.backfill_rollups_from_raw().await.unwrap();
+        // A later startup must not replace a complete aggregate with surviving
+        // raw rows from a partially expired bucket.
+        sqlx::query("UPDATE heart_rate_rollups SET sample_count=2,bpm_sum=140,bpm_sum_sq=9800 WHERE collector_id=$1 AND bucket_ms=$2")
+            .bind(&session.collector_id).bind(rollup_bucket(old)).execute(pool).await.unwrap();
+        db.backfill_rollups_from_raw().await.unwrap();
+        db.prune_expired(now).await.unwrap();
+        let before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM heart_rate_samples WHERE collector_id=$1")
+                .bind(&session.collector_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            before, 3,
+            "app sweeper must not delete rows in a hypertable"
+        );
+        sqlx::query("CALL run_job($1)")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let remaining: Vec<i64> = sqlx::query_scalar(
+            "SELECT t_ms FROM heart_rate_samples WHERE collector_id=$1 ORDER BY t_ms",
+        )
+        .bind(&session.collector_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, vec![boundary, now]);
+        let old_chunks: i64 = sqlx::query_scalar("SELECT count(*) FROM timescaledb_information.chunks WHERE hypertable_name='heart_rate_samples' AND range_end_integer < $1")
+            .bind(now - RAW_SAMPLE_TTL_MS).fetch_one(pool).await.unwrap();
+        assert_eq!(old_chunks, 0);
+        let rollup_count: i64 = sqlx::query_scalar(
+            "SELECT sample_count FROM heart_rate_rollups WHERE collector_id=$1 AND bucket_ms=$2",
+        )
+        .bind(&session.collector_id)
+        .bind(rollup_bucket(old))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(rollup_count, 2);
+        let again = Db::connect(&url).await.unwrap();
+        assert!(again.native_raw_retention);
+        let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM timescaledb_information.jobs WHERE hypertable_name='heart_rate_samples' AND proc_name='policy_retention'")
+            .fetch_one(pool).await.unwrap();
+        assert_eq!(jobs, 1);
+
+        // A second initializer must time out rather than hang behind a lock.
+        let mut holder = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(728143902)")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let blocked = db.configure_raw_retention().await;
+        let elapsed = started.elapsed();
+        sqlx::query("SELECT pg_advisory_unlock(728143902)")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        assert!(blocked.is_err());
+        assert!(elapsed < Duration::from_secs(10));
+
+        // Do not silently replace a different operator-configured TTL.
+        sqlx::query("SELECT alter_job($1, config => (SELECT jsonb_set(config, '{drop_after}', '172800000'::jsonb) FROM timescaledb_information.jobs WHERE job_id=$1))")
+            .bind(job_id).execute(pool).await.unwrap();
+        assert!(db.configure_raw_retention().await.is_err());
+        let ttl: i64 = sqlx::query_scalar("SELECT (config->>'drop_after')::bigint FROM timescaledb_information.jobs WHERE job_id=$1")
+            .bind(job_id).fetch_one(pool).await.unwrap();
+        assert_eq!(ttl, 172800000);
     }
 
     #[tokio::test]
