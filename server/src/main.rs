@@ -25,7 +25,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     PgPool, Row, SqlitePool,
 };
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, services::ServeDir, set_header::SetResponseHeaderLayer};
 use uuid::Uuid;
@@ -47,6 +47,7 @@ const MAX_BODY_BYTES: usize = 128 * 1024;
 #[derive(Clone)]
 struct AppState {
     inner: Arc<RwLock<Store>>,
+    collector_write_lock: Arc<Mutex<()>>,
     events: broadcast::Sender<LobbyEvent>,
     db: Db,
 }
@@ -255,7 +256,7 @@ enum LobbyEvent {
         participants: Vec<Participant>,
     },
     #[serde(rename = "participant_update")]
-    ParticipantUpdate { participant: Participant },
+    ParticipantUpdate { participant: Box<Participant> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1024,7 +1025,7 @@ impl Db {
         seq: u64,
         samples: &[SeriesSample],
         recv_ms: i64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         match &self.pool {
             DbPool::Sqlite(pool) => {
                 self.persist_ingest_sqlite(pool, collector, seq, samples, recv_ms)
@@ -1210,8 +1211,21 @@ impl Db {
         seq: u64,
         samples: &[SeriesSample],
         recv_ms: i64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let mut tx = pool.begin().await?;
+        let seq_inserted = sqlx::query(
+            "INSERT OR IGNORE INTO collector_seqs (collector_id, seq, seen_at_ms) VALUES (?, ?, ?)",
+        )
+        .bind(&collector.collector_id)
+        .bind(seq as i64)
+        .bind(recv_ms)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if seq_inserted == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
         sqlx::query(
             r#"
             UPDATE collectors
@@ -1241,14 +1255,6 @@ impl Db {
         .bind(&collector.sleep_segments_json)
         .bind(collector.sleep_updated_at_ms)
         .bind(&collector.collector_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO collector_seqs (collector_id, seq, seen_at_ms) VALUES (?, ?, ?)",
-        )
-        .bind(&collector.collector_id)
-        .bind(seq as i64)
-        .bind(recv_ms)
         .execute(&mut *tx)
         .await?;
         for sample in samples {
@@ -1321,7 +1327,7 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     async fn persist_ingest_postgres(
@@ -1331,8 +1337,21 @@ impl Db {
         seq: u64,
         samples: &[SeriesSample],
         recv_ms: i64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let mut tx = pool.begin().await?;
+        let seq_inserted = sqlx::query(
+            "INSERT INTO collector_seqs (collector_id, seq, seen_at_ms) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(&collector.collector_id)
+        .bind(seq as i64)
+        .bind(recv_ms)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if seq_inserted == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
         sqlx::query(
             r#"
             UPDATE collectors
@@ -1362,14 +1381,6 @@ impl Db {
         .bind(&collector.sleep_segments_json)
         .bind(collector.sleep_updated_at_ms)
         .bind(&collector.collector_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO collector_seqs (collector_id, seq, seen_at_ms) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-        )
-        .bind(&collector.collector_id)
-        .bind(seq as i64)
-        .bind(recv_ms)
         .execute(&mut *tx)
         .await?;
         for sample in samples {
@@ -1442,7 +1453,7 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1480,6 +1491,7 @@ async fn app_with_database(database_url: &str) -> anyhow::Result<Router> {
     start_retention_sweeper(db.clone());
     let state = AppState {
         inner: Arc::new(RwLock::new(store)),
+        collector_write_lock: Arc::new(Mutex::new(())),
         events,
         db,
     };
@@ -1587,6 +1599,7 @@ async fn create_session(
     headers: HeaderMap,
     Json(request): Json<SessionRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
+    let _collector_write_guard = state.collector_write_lock.lock().await;
     let display_name = truncate(&request.display_name, 80);
     let device_model = truncate(&request.device_model, 80);
     let client_platform = truncate(&request.client_platform, 32);
@@ -1706,23 +1719,30 @@ async fn ingest_batch(
         return Err(ApiError::BadRequest("unsupported schema"));
     }
 
+    let collector_write_guard = state.collector_write_lock.lock().await;
     let payload_seq = payload.seq;
     let mut event_display_name = None;
     let mut persist_collector = None;
     let mut persist_samples = Vec::new();
     let mut persist_recv_ms = 0;
-    let accepted = {
-        let mut store = state.inner.write().await;
+    let (accepted, updated_collector) = {
+        let store = state.inner.read().await;
         let Some(collector_id) = store.tokens.get(token).cloned() else {
             return Err(ApiError::Unauthorized);
         };
         if collector_id != payload.collector_id {
             return Err(ApiError::Unauthorized);
         }
-        let Some(collector) = store.collectors.get_mut(&collector_id) else {
+        let Some(existing_collector) = store.collectors.get(&collector_id) else {
             return Err(ApiError::Unauthorized);
         };
-        if collector.seen_seqs.contains(&payload_seq) {
+        if existing_collector.seen_seqs.contains(&payload_seq) {
+            tracing::warn!(
+                collector_id = %existing_collector.collector_id,
+                seq = payload_seq,
+                sample_count = payload.samples.len(),
+                "dropped duplicate ingest batch"
+            );
             return Ok(Json(IngestResponse {
                 ok: true,
                 accepted: 0,
@@ -1730,6 +1750,8 @@ async fn ingest_batch(
                 next_policy: None,
             }));
         }
+        let mut collector = existing_collector.clone();
+        drop(store);
 
         let recv_ms = now_ms();
         let anchor_ms = if (payload.sent_at_ms - recv_ms).abs() > MAX_CLOCK_SKEW_MS {
@@ -1763,7 +1785,7 @@ async fn ingest_batch(
             persist_samples.push(series_sample);
             accepted += 1;
             let comparable_last_seen_ms = collector.last_seen_ms.map(|last| last.min(recv_ms));
-            if comparable_last_seen_ms.map_or(true, |last| t_ms >= last) {
+            if comparable_last_seen_ms.is_none_or(|last| t_ms >= last) {
                 collector.last_seen_ms = Some(t_ms);
                 collector.last_bpm = Some(sample.bpm);
                 latest_changed = true;
@@ -1799,8 +1821,9 @@ async fn ingest_batch(
             metadata_changed |= collector.device_model != next;
             collector.device_model = next;
         }
+        let carries_sleep = payload.sleep.is_some();
         if let Some(sleep) = payload.sleep {
-            sleep_changed = apply_sleep_status(collector, sleep, recv_ms);
+            sleep_changed = apply_sleep_status(&mut collector, sleep, recv_ms);
         }
         collector.updated_at_ms = Some(recv_ms);
         trim_series(&mut collector.series, recv_ms);
@@ -1808,26 +1831,49 @@ async fn ingest_batch(
         if (accepted > 0 && latest_changed) || sleep_changed || metadata_changed {
             event_display_name = Some(collector.display_name.clone());
         }
-        if accepted > 0 || sleep_changed || metadata_changed {
+        if accepted > 0 || sleep_changed || metadata_changed || carries_sleep {
             persist_collector = Some(collector.clone());
             persist_recv_ms = recv_ms;
         }
-        accepted
+        (accepted, collector)
     };
 
     if let Some(collector) = persist_collector {
-        state
+        match state
             .db
             .persist_ingest(&collector, payload_seq, &persist_samples, persist_recv_ms)
-            .await?;
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    collector_id = %collector.collector_id,
+                    seq = payload_seq,
+                    "dropped ingest batch already committed in database"
+                );
+                return Ok(Json(IngestResponse {
+                    ok: true,
+                    accepted: 0,
+                    server_time_ms: now_ms(),
+                    next_policy: None,
+                }));
+            }
+            Err(err) => return Err(err.into()),
+        }
     }
+    let mut store = state.inner.write().await;
+    store
+        .collectors
+        .insert(updated_collector.collector_id.clone(), updated_collector);
+    drop(store);
+    drop(collector_write_guard);
 
     if let Some(display_name) = event_display_name {
         let store = state.inner.read().await;
         if let Some(participant) = aggregate_participant_for_name(&store, &display_name, now_ms()) {
-            let _ = state
-                .events
-                .send(LobbyEvent::ParticipantUpdate { participant });
+            let _ = state.events.send(LobbyEvent::ParticipantUpdate {
+                participant: Box::new(participant),
+            });
         }
     }
 
@@ -2637,6 +2683,28 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn lobby_response(app: Router) -> LobbyResponse {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/lobby/participants")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn lobby_sleep(app: Router) -> ParticipantSleepStatus {
+        lobby_response(app).await.participants[0]
+            .sleep
+            .clone()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn session_ingest_and_lobby_work() {
         let app = test_app().await;
@@ -3112,6 +3180,147 @@ mod tests {
         let series: SeriesResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(series.samples.len(), 2);
         assert_eq!(series.samples[1].bpm, 82);
+    }
+
+    #[tokio::test]
+    async fn failed_persist_rolls_back_seq_and_retransmit_lands_once() {
+        let (app, database_url) = test_app_with_url().await;
+        let session = create_test_session(app.clone()).await;
+        let current_ms = now_ms();
+        let payload = BatchPayload {
+            schema: 1,
+            collector_id: session.collector_id.clone(),
+            seq: 7,
+            sent_at_ms: current_ms,
+            display_name: Some("Allen".to_string()),
+            device_model: Some("Mi Band".to_string()),
+            samples: vec![
+                RelativeSample {
+                    dt_ms: -1_000,
+                    bpm: 80,
+                },
+                RelativeSample { dt_ms: 0, bpm: 82 },
+            ],
+            ble: None,
+            sleep: Some(SleepStatusPayload {
+                state: "awake".to_string(),
+                observed_at_ms: Some(current_ms),
+                bed_at_ms: None,
+                sleep_at_ms: None,
+                wake_at_ms: Some(current_ms - 60_000),
+                go_bed_at_ms: None,
+                device_bed_at_ms: None,
+                leave_bed_at_ms: None,
+                device_wake_at_ms: None,
+                source: Some("miwear-property-provisional".to_string()),
+                stable: Some(false),
+                duration_minutes: None,
+                segments: None,
+            }),
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE heart_rate_samples RENAME TO heart_rate_samples_offline")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/hr/batches")
+                    .header(header::CONTENT_TYPE, "application/cbor")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", session.collector_token),
+                    )
+                    .body(Body::from(serde_cbor::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(lobby_response(app.clone()).await.participants.is_empty());
+        sqlx::query("ALTER TABLE heart_rate_samples_offline RENAME TO heart_rate_samples")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let retransmit = BatchPayload {
+            samples: vec![
+                RelativeSample {
+                    dt_ms: -1_000,
+                    bpm: 80,
+                },
+                RelativeSample { dt_ms: 0, bpm: 82 },
+                RelativeSample {
+                    dt_ms: 1_000,
+                    bpm: 84,
+                },
+            ],
+            ..payload
+        };
+        assert_eq!(
+            post_batch(app.clone(), &session, &retransmit)
+                .await
+                .accepted,
+            3
+        );
+        let sleep = lobby_sleep(app.clone()).await;
+        assert_eq!(sleep.state, "awake");
+        assert_eq!(sleep.observed_at_ms, Some(current_ms));
+        assert_eq!(sleep.wake_at_ms, Some(current_ms - 60_000));
+        let raw_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM heart_rate_samples WHERE collector_id = ?")
+                .bind(&session.collector_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(raw_count, 3);
+
+        sqlx::query("INSERT INTO collector_seqs (collector_id, seq, seen_at_ms) VALUES (?, ?, ?)")
+            .bind(&session.collector_id)
+            .bind(8_i64)
+            .bind(current_ms)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let already_persisted = BatchPayload {
+            seq: 8,
+            samples: vec![RelativeSample {
+                dt_ms: 2_000,
+                bpm: 86,
+            }],
+            ..retransmit
+        };
+        assert_eq!(
+            post_batch(app.clone(), &session, &already_persisted)
+                .await
+                .accepted,
+            0
+        );
+        assert_eq!(lobby_response(app).await.participants[0].last_bpm, Some(84));
+        let raw_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM heart_rate_samples WHERE collector_id = ?")
+                .bind(&session.collector_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(raw_count, 3);
+        let rollup_count: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(sample_count), 0) FROM heart_rate_rollups WHERE collector_id = ?",
+        )
+        .bind(&session.collector_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rollup_count, 3);
+        pool.close().await;
     }
 
     #[tokio::test]
