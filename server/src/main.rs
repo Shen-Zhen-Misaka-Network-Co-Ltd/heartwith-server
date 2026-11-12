@@ -32,7 +32,9 @@ use uuid::Uuid;
 
 const MIN_BPM: i32 = 30;
 const MAX_BPM: i32 = 240;
-const ONLINE_AFTER_MS: i64 = 20_000;
+/// Collectors flush batches every 8-30 s (plus up to 5 s timer slack), so a 20 s window made
+/// healthy collectors flicker to stale between batches.
+const ONLINE_AFTER_MS: i64 = 45_000;
 const OFFLINE_AFTER_MS: i64 = 120_000;
 const MAX_CLOCK_SKEW_MS: i64 = 60_000;
 const MAX_SAMPLE_FUTURE_MS: i64 = 5_000;
@@ -3816,11 +3818,11 @@ mod tests {
     fn participant_status_boundaries_match_lobby_contract() {
         let current_ms = 1_000_000;
         assert!(matches!(
-            status_for(Some(current_ms - 20_000), current_ms),
+            status_for(Some(current_ms - 45_000), current_ms),
             ParticipantStatus::Online
         ));
         assert!(matches!(
-            status_for(Some(current_ms - 20_001), current_ms),
+            status_for(Some(current_ms - 45_001), current_ms),
             ParticipantStatus::Stale
         ));
         assert!(matches!(
