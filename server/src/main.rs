@@ -2561,7 +2561,11 @@ fn rollup_bucket(t_ms: i64) -> i64 {
 
 fn start_retention_sweeper(db: Db) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(RETENTION_SWEEP_INTERVAL);
+        // Db::connect already pruned during startup; the first sweep waits a full period.
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + RETENTION_SWEEP_INTERVAL,
+            RETENTION_SWEEP_INTERVAL,
+        );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
