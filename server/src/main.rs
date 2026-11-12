@@ -68,6 +68,20 @@ impl AppState {
     }
 }
 
+/// Clients that number batches by wall-clock time use seqs at or above this value. They are
+/// unique across processes and restarts, so they survive session re-creation; small legacy
+/// counters restart at 1 and must be forgotten when a session is re-created.
+const TIME_BASED_SEQ_FLOOR: u64 = 1_000_000_000_000;
+
+fn forget_legacy_seqs(collector: &mut Collector) {
+    collector
+        .seq_order
+        .retain(|seq| *seq >= TIME_BASED_SEQ_FLOOR);
+    collector
+        .seen_seqs
+        .retain(|seq| *seq >= TIME_BASED_SEQ_FLOOR);
+}
+
 fn new_collector_token() -> String {
     Uuid::new_v4().as_hyphenated().to_string() + "." + &Uuid::new_v4().simple().to_string()
 }
@@ -1057,6 +1071,7 @@ impl Db {
     ) -> anyhow::Result<()> {
         match &self.pool {
             DbPool::Sqlite(pool) => {
+                let mut tx = pool.begin().await?;
                 sqlx::query(
                     r#"
             UPDATE collectors
@@ -1069,14 +1084,17 @@ impl Db {
                 .bind(app_version)
                 .bind(token)
                 .bind(collector_id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
-                sqlx::query("DELETE FROM collector_seqs WHERE collector_id = ?")
+                sqlx::query("DELETE FROM collector_seqs WHERE collector_id = ? AND seq < ?")
                     .bind(collector_id)
-                    .execute(pool)
+                    .bind(TIME_BASED_SEQ_FLOOR as i64)
+                    .execute(&mut *tx)
                     .await?;
+                tx.commit().await?;
             }
             DbPool::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
                 sqlx::query(
                     r#"
             UPDATE collectors
@@ -1089,12 +1107,14 @@ impl Db {
                 .bind(app_version)
                 .bind(token)
                 .bind(collector_id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
-                sqlx::query("DELETE FROM collector_seqs WHERE collector_id = $1")
+                sqlx::query("DELETE FROM collector_seqs WHERE collector_id = $1 AND seq < $2")
                     .bind(collector_id)
-                    .execute(pool)
+                    .bind(TIME_BASED_SEQ_FLOOR as i64)
+                    .execute(&mut *tx)
                     .await?;
+                tx.commit().await?;
             }
         }
         Ok(())
@@ -1708,8 +1728,7 @@ async fn create_session(
             collector.device_model = device_model;
             collector._client_platform = client_platform;
             collector._app_version = app_version;
-            collector.seen_seqs.clear();
-            collector.seq_order.clear();
+            forget_legacy_seqs(collector);
             collector.clone()
         }) else {
             return Err(ApiError::Unauthorized);
@@ -3819,4 +3838,52 @@ mod tests {
         assert_eq!(collector.last_bpm, Some(104));
         assert_eq!(collector.last_seen_ms, Some(current_ms - 10_000));
     }
+
+    #[tokio::test]
+    async fn session_recreation_keeps_time_based_seqs_but_forgets_legacy_ones() {
+        let app = test_app().await;
+        let session = create_test_session(app.clone()).await;
+        let time_seq = now_ms() as u64 * 8;
+        let batch = |seq: u64, bpm: i32| BatchPayload {
+            schema: 1,
+            collector_id: session.collector_id.clone(),
+            seq,
+            sent_at_ms: now_ms(),
+            display_name: Some("Allen".to_string()),
+            device_model: Some("Mi Band".to_string()),
+            samples: vec![RelativeSample { dt_ms: 0, bpm }],
+            ble: None,
+            sleep: None,
+        };
+        assert_eq!(
+            post_batch(app.clone(), &session, &batch(1, 70))
+                .await
+                .accepted,
+            1
+        );
+        assert_eq!(
+            post_batch(app.clone(), &session, &batch(time_seq, 71))
+                .await
+                .accepted,
+            1
+        );
+
+        let again = create_test_session(app.clone()).await;
+        assert_eq!(again.collector_id, session.collector_id);
+        // A legacy client restarts its counter at 1 after a new session.
+        assert_eq!(
+            post_batch(app.clone(), &again, &batch(1, 72))
+                .await
+                .accepted,
+            1
+        );
+        // A retried time-based batch that already landed must stay deduplicated.
+        assert_eq!(
+            post_batch(app.clone(), &again, &batch(time_seq, 73))
+                .await
+                .accepted,
+            0
+        );
+    }
+
 }
