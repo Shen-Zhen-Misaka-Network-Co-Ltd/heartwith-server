@@ -87,6 +87,51 @@ fn new_collector_token() -> String {
     Uuid::new_v4().as_hyphenated().to_string() + "." + &Uuid::new_v4().simple().to_string()
 }
 
+/// Per-hour rollup contribution of one batch, pre-aggregated so a batch costs one
+/// upsert per touched hour instead of one per sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RollupDelta {
+    bucket_ms: i64,
+    sample_count: i64,
+    bpm_sum: i64,
+    bpm_sum_sq: i64,
+    min_bpm: i32,
+    max_bpm: i32,
+    first_t_ms: i64,
+    last_t_ms: i64,
+}
+
+fn rollup_deltas(samples: &[SeriesSample]) -> Vec<RollupDelta> {
+    let mut buckets: std::collections::BTreeMap<i64, RollupDelta> =
+        std::collections::BTreeMap::new();
+    for sample in samples {
+        let bucket_ms = rollup_bucket(sample.t_ms);
+        let bpm = sample.bpm as i64;
+        buckets
+            .entry(bucket_ms)
+            .and_modify(|delta| {
+                delta.sample_count += 1;
+                delta.bpm_sum += bpm;
+                delta.bpm_sum_sq += bpm * bpm;
+                delta.min_bpm = delta.min_bpm.min(sample.bpm);
+                delta.max_bpm = delta.max_bpm.max(sample.bpm);
+                delta.first_t_ms = delta.first_t_ms.min(sample.t_ms);
+                delta.last_t_ms = delta.last_t_ms.max(sample.t_ms);
+            })
+            .or_insert(RollupDelta {
+                bucket_ms,
+                sample_count: 1,
+                bpm_sum: bpm,
+                bpm_sum_sq: bpm * bpm,
+                min_bpm: sample.bpm,
+                max_bpm: sample.bpm,
+                first_t_ms: sample.t_ms,
+                last_t_ms: sample.t_ms,
+            });
+    }
+    buckets.into_values().collect()
+}
+
 #[derive(Default)]
 struct Store {
     collectors: HashMap<String, Collector>,
@@ -1391,16 +1436,17 @@ impl Db {
             .bind(recv_ms)
             .execute(&mut *tx)
             .await?;
-            let bucket_ms = rollup_bucket(sample.t_ms);
+        }
+        for delta in rollup_deltas(samples) {
             sqlx::query(
                 r#"
                 INSERT INTO heart_rate_rollups (
                     collector_id, bucket_ms, sample_count, bpm_sum, bpm_sum_sq,
                     min_bpm, max_bpm, first_t_ms, last_t_ms
                 )
-                VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(collector_id, bucket_ms) DO UPDATE SET
-                    sample_count = sample_count + 1,
+                    sample_count = sample_count + excluded.sample_count,
                     bpm_sum = bpm_sum + excluded.bpm_sum,
                     bpm_sum_sq = bpm_sum_sq + excluded.bpm_sum_sq,
                     min_bpm = MIN(min_bpm, excluded.min_bpm),
@@ -1410,42 +1456,18 @@ impl Db {
                 "#,
             )
             .bind(&collector.collector_id)
-            .bind(bucket_ms)
-            .bind(sample.bpm as i64)
-            .bind(sample.bpm as i64 * sample.bpm as i64)
-            .bind(sample.bpm)
-            .bind(sample.bpm)
-            .bind(sample.t_ms)
-            .bind(sample.t_ms)
+            .bind(delta.bucket_ms)
+            .bind(delta.sample_count)
+            .bind(delta.bpm_sum)
+            .bind(delta.bpm_sum_sq)
+            .bind(delta.min_bpm)
+            .bind(delta.max_bpm)
+            .bind(delta.first_t_ms)
+            .bind(delta.last_t_ms)
             .execute(&mut *tx)
             .await?;
         }
-        sqlx::query("DELETE FROM heart_rate_samples WHERE collector_id = ? AND t_ms < ?")
-            .bind(&collector.collector_id)
-            .bind(recv_ms - RAW_SAMPLE_TTL_MS)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM heart_rate_rollups WHERE collector_id = ? AND bucket_ms < ?")
-            .bind(&collector.collector_id)
-            .bind(recv_ms - ROLLUP_TTL_MS)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            r#"
-            DELETE FROM collector_seqs
-            WHERE collector_id = ?
-              AND seq NOT IN (
-                  SELECT seq FROM collector_seqs
-                  WHERE collector_id = ?
-                  ORDER BY seen_at_ms DESC
-                  LIMIT 512
-              )
-            "#,
-        )
-        .bind(&collector.collector_id)
-        .bind(&collector.collector_id)
-        .execute(&mut *tx)
-        .await?;
+        // Expiry of samples, rollups and dedupe seqs is owned by the retention sweeper.
         tx.commit().await?;
         Ok(true)
     }
@@ -1503,30 +1525,50 @@ impl Db {
         .bind(&collector.collector_id)
         .execute(&mut *tx)
         .await?;
-        for sample in samples {
+        if !samples.is_empty() {
+            let t_ms: Vec<i64> = samples.iter().map(|sample| sample.t_ms).collect();
+            let bpm: Vec<i32> = samples.iter().map(|sample| sample.bpm).collect();
             sqlx::query(
                 r#"
                 INSERT INTO heart_rate_samples (collector_id, t_ms, bpm, seq, received_at_ms)
-                VALUES ($1, $2, $3, $4, $5)
+                SELECT $1, t_ms, bpm, $4, $5
+                FROM UNNEST($2::BIGINT[], $3::INTEGER[]) AS batch(t_ms, bpm)
                 "#,
             )
             .bind(&collector.collector_id)
-            .bind(sample.t_ms)
-            .bind(sample.bpm)
+            .bind(&t_ms)
+            .bind(&bpm)
             .bind(seq as i64)
             .bind(recv_ms)
             .execute(&mut *tx)
             .await?;
-            let bucket_ms = rollup_bucket(sample.t_ms);
+        }
+        let deltas = rollup_deltas(samples);
+        if !deltas.is_empty() {
+            let column = |f: fn(&RollupDelta) -> i64| deltas.iter().map(f).collect::<Vec<i64>>();
+            let bucket_ms = column(|d| d.bucket_ms);
+            let sample_count = column(|d| d.sample_count);
+            let bpm_sum = column(|d| d.bpm_sum);
+            let bpm_sum_sq = column(|d| d.bpm_sum_sq);
+            let first_t_ms = column(|d| d.first_t_ms);
+            let last_t_ms = column(|d| d.last_t_ms);
+            let min_bpm: Vec<i32> = deltas.iter().map(|d| d.min_bpm).collect();
+            let max_bpm: Vec<i32> = deltas.iter().map(|d| d.max_bpm).collect();
             sqlx::query(
                 r#"
                 INSERT INTO heart_rate_rollups (
                     collector_id, bucket_ms, sample_count, bpm_sum, bpm_sum_sq,
                     min_bpm, max_bpm, first_t_ms, last_t_ms
                 )
-                VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8)
+                SELECT $1, bucket_ms, sample_count, bpm_sum, bpm_sum_sq,
+                       min_bpm, max_bpm, first_t_ms, last_t_ms
+                FROM UNNEST(
+                    $2::BIGINT[], $3::BIGINT[], $4::BIGINT[], $5::BIGINT[],
+                    $6::INTEGER[], $7::INTEGER[], $8::BIGINT[], $9::BIGINT[]
+                ) AS batch(bucket_ms, sample_count, bpm_sum, bpm_sum_sq,
+                           min_bpm, max_bpm, first_t_ms, last_t_ms)
                 ON CONFLICT(collector_id, bucket_ms) DO UPDATE SET
-                    sample_count = heart_rate_rollups.sample_count + 1,
+                    sample_count = heart_rate_rollups.sample_count + excluded.sample_count,
                     bpm_sum = heart_rate_rollups.bpm_sum + excluded.bpm_sum,
                     bpm_sum_sq = heart_rate_rollups.bpm_sum_sq + excluded.bpm_sum_sq,
                     min_bpm = LEAST(heart_rate_rollups.min_bpm, excluded.min_bpm),
@@ -1536,35 +1578,20 @@ impl Db {
                 "#,
             )
             .bind(&collector.collector_id)
-            .bind(bucket_ms)
-            .bind(sample.bpm as i64)
-            .bind(sample.bpm as i64 * sample.bpm as i64)
-            .bind(sample.bpm)
-            .bind(sample.bpm)
-            .bind(sample.t_ms)
-            .bind(sample.t_ms)
+            .bind(&bucket_ms)
+            .bind(&sample_count)
+            .bind(&bpm_sum)
+            .bind(&bpm_sum_sq)
+            .bind(&min_bpm)
+            .bind(&max_bpm)
+            .bind(&first_t_ms)
+            .bind(&last_t_ms)
             .execute(&mut *tx)
             .await?;
         }
-        // The retention sweeper owns expiry. A per-batch DELETE on a hypertable
-        // locks historical chunks and can exhaust the shared lock table before
-        // this ingest transaction commits, even when no rows need removal.
-        sqlx::query(
-            r#"
-            DELETE FROM collector_seqs
-            WHERE collector_id = $1
-              AND seq NOT IN (
-                  SELECT seq FROM collector_seqs
-                  WHERE collector_id = $2
-                  ORDER BY seen_at_ms DESC
-                  LIMIT 512
-              )
-            "#,
-        )
-        .bind(&collector.collector_id)
-        .bind(&collector.collector_id)
-        .execute(&mut *tx)
-        .await?;
+        // Expiry is owned by the retention sweeper. A per-batch DELETE on a hypertable locks
+        // historical chunks and can exhaust the shared lock table, and the old per-batch
+        // collector_seqs pruning ran a NOT IN subquery on every upload.
         tx.commit().await?;
         Ok(true)
     }
@@ -2749,15 +2776,24 @@ mod tests {
     }
 
     async fn create_test_session(app: Router) -> SessionResponse {
+        create_named_session(app, "Allen").await
+    }
+
+    async fn create_named_session(app: Router, display_name: &str) -> SessionResponse {
+        let body = serde_json::json!({
+            "display_name": display_name,
+            "device_model": "Mi Band",
+            "client_platform": "android",
+            "app_version": "test",
+        })
+        .to_string();
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/collector/sessions")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"display_name":"Allen","device_model":"Mi Band","client_platform":"android","app_version":"test"}"#,
-                    ))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
@@ -3858,6 +3894,42 @@ mod tests {
         assert_eq!(collector.last_seen_ms, Some(current_ms - 10_000));
     }
 
+    #[test]
+    fn rollup_deltas_aggregate_each_hour_once() {
+        let base = 10 * ROLLUP_BUCKET_MS;
+        let samples = vec![
+            SeriesSample {
+                t_ms: base + 5_000,
+                bpm: 70,
+            },
+            SeriesSample {
+                t_ms: base + 1_000,
+                bpm: 90,
+            },
+            SeriesSample {
+                t_ms: base + ROLLUP_BUCKET_MS + 1,
+                bpm: 60,
+            },
+        ];
+        let deltas = rollup_deltas(&samples);
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(
+            deltas[0],
+            RollupDelta {
+                bucket_ms: base,
+                sample_count: 2,
+                bpm_sum: 160,
+                bpm_sum_sq: 70 * 70 + 90 * 90,
+                min_bpm: 70,
+                max_bpm: 90,
+                first_t_ms: base + 1_000,
+                last_t_ms: base + 5_000,
+            }
+        );
+        assert_eq!(deltas[1].bucket_ms, base + ROLLUP_BUCKET_MS);
+        assert_eq!(deltas[1].sample_count, 1);
+    }
+
     #[tokio::test]
     async fn session_recreation_keeps_time_based_seqs_but_forgets_legacy_ones() {
         let app = test_app().await;
@@ -3905,4 +3977,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires a disposable TimescaleDB database in HEARTWITH_RETENTION_TEST_URL"]
+    async fn postgres_batch_ingest_writes_samples_and_merged_rollups() {
+        let url = std::env::var("HEARTWITH_RETENTION_TEST_URL").unwrap();
+        let app = app_with_database(&url).await.unwrap();
+        let session = create_named_session(app.clone(), "PgIngest").await;
+        let db = Db::connect(&url).await.unwrap();
+        let DbPool::Postgres(pool) = &db.pool else {
+            panic!("PostgreSQL required")
+        };
+        let sent_at_ms = now_ms();
+        let bucket = rollup_bucket(sent_at_ms - 2_000);
+        let totals = |pool: PgPool| {
+            let collector_id = session.collector_id.clone();
+            async move {
+                let raw: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM heart_rate_samples WHERE collector_id=$1 AND t_ms >= $2",
+                )
+                .bind(&collector_id)
+                .bind(bucket)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                let rollup: (i64, i64) = sqlx::query_as(
+                    "SELECT COALESCE(sum(sample_count),0)::BIGINT, COALESCE(sum(bpm_sum),0)::BIGINT FROM heart_rate_rollups WHERE collector_id=$1 AND bucket_ms >= $2",
+                )
+                .bind(&collector_id)
+                .bind(bucket)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                (raw, rollup.0, rollup.1)
+            }
+        };
+        let before = totals(pool.clone()).await;
+        let payload = BatchPayload {
+            schema: 1,
+            collector_id: session.collector_id.clone(),
+            seq: sent_at_ms as u64 * 8 + 3,
+            sent_at_ms,
+            display_name: Some("PgIngest".to_string()),
+            device_model: Some("Mi Band".to_string()),
+            samples: vec![
+                RelativeSample {
+                    dt_ms: -2_000,
+                    bpm: 70,
+                },
+                RelativeSample {
+                    dt_ms: -1_000,
+                    bpm: 80,
+                },
+                RelativeSample { dt_ms: 0, bpm: 90 },
+            ],
+            ble: None,
+            sleep: None,
+        };
+        assert_eq!(
+            post_batch(app.clone(), &session, &payload).await.accepted,
+            3
+        );
+        assert_eq!(post_batch(app, &session, &payload).await.accepted, 0);
+        let after = totals(pool.clone()).await;
+        assert_eq!(after.0 - before.0, 3);
+        assert_eq!(after.1 - before.1, 3);
+        assert_eq!(after.2 - before.2, 240);
+    }
 }
