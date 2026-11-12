@@ -2022,9 +2022,8 @@ fn decode_payload(headers: &HeaderMap, bytes: &[u8]) -> Result<BatchPayload, Api
         .trim();
 
     match content_type {
-        "application/cbor" => {
-            serde_cbor::from_slice(bytes).map_err(|_| ApiError::BadRequest("invalid cbor"))
-        }
+        "application/cbor" => ciborium::de::from_reader::<BatchPayload, _>(bytes)
+            .map_err(|_| ApiError::BadRequest("invalid cbor")),
         "application/json" => {
             serde_json::from_slice(bytes).map_err(|_| ApiError::BadRequest("invalid json"))
         }
@@ -2656,6 +2655,12 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    fn cbor_bytes<T: Serialize>(value: &T) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(value, &mut bytes).unwrap();
+        bytes
+    }
+
     async fn test_app() -> Router {
         test_app_with_url().await.0
     }
@@ -2768,7 +2773,7 @@ mod tests {
         session: &SessionResponse,
         payload: &BatchPayload,
     ) -> IngestResponse {
-        let body = serde_cbor::to_vec(payload).unwrap();
+        let body = cbor_bytes(payload);
         let response = app
             .oneshot(
                 Request::builder()
@@ -3451,7 +3456,7 @@ mod tests {
                         header::AUTHORIZATION,
                         format!("Bearer {}", session.collector_token),
                     )
-                    .body(Body::from(serde_cbor::to_vec(&payload).unwrap()))
+                    .body(Body::from(cbor_bytes(&payload)))
                     .unwrap(),
             )
             .await
