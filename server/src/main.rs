@@ -2462,9 +2462,7 @@ fn explicit_host_port(host: &str) -> Option<u16> {
         let (_, rest) = host.split_once(']')?;
         return rest.strip_prefix(':')?.parse().ok();
     }
-    let mut parts = host.rsplitn(2, ':');
-    let port = parts.next()?;
-    let hostname = parts.next()?;
+    let (hostname, port) = host.rsplit_once(':')?;
     if hostname.contains(':') {
         return None;
     }
