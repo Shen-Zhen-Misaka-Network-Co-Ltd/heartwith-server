@@ -2043,34 +2043,70 @@ fn apply_sleep_status(
     {
         return false;
     }
-    let go_bed_at_ms = sanitize_event_ms(payload.go_bed_at_ms, recv_ms);
-    let device_bed_at_ms = sanitize_event_ms(payload.device_bed_at_ms, recv_ms);
-    let leave_bed_at_ms = sanitize_event_ms(payload.leave_bed_at_ms, recv_ms);
-    let device_wake_at_ms = sanitize_event_ms(payload.device_wake_at_ms, recv_ms);
-    let bed_at_ms = go_bed_at_ms.or_else(|| sanitize_event_ms(payload.bed_at_ms, recv_ms));
-    let sleep_at_ms = device_bed_at_ms.or_else(|| sanitize_event_ms(payload.sleep_at_ms, recv_ms));
+    let previous_state = collector.sleep_state.as_deref();
+    let starts_new_window = state != "awake" && previous_state == Some("awake");
+    let go_bed_at_ms = carry_sleep_field(
+        sanitize_event_ms(payload.go_bed_at_ms, recv_ms),
+        collector.sleep_go_bed_at_ms,
+        starts_new_window,
+    );
+    let device_bed_at_ms = carry_sleep_field(
+        sanitize_event_ms(payload.device_bed_at_ms, recv_ms),
+        collector.sleep_device_bed_at_ms,
+        starts_new_window,
+    );
+    let leave_bed_at_ms = carry_sleep_field(
+        sanitize_event_ms(payload.leave_bed_at_ms, recv_ms),
+        collector.sleep_leave_bed_at_ms,
+        starts_new_window,
+    );
+    let device_wake_at_ms = carry_sleep_field(
+        sanitize_event_ms(payload.device_wake_at_ms, recv_ms),
+        collector.sleep_device_wake_at_ms,
+        starts_new_window,
+    );
+    let bed_at_ms = carry_sleep_field(
+        go_bed_at_ms.or_else(|| sanitize_event_ms(payload.bed_at_ms, recv_ms)),
+        collector.sleep_bed_at_ms,
+        starts_new_window,
+    );
+    let sleep_at_ms = carry_sleep_field(
+        device_bed_at_ms.or_else(|| sanitize_event_ms(payload.sleep_at_ms, recv_ms)),
+        collector.sleep_at_ms,
+        starts_new_window,
+    );
     let wake_at_ms = if state == "awake" {
-        device_wake_at_ms
-            .or_else(|| sanitize_event_ms(payload.wake_at_ms, recv_ms))
-            .or(leave_bed_at_ms)
+        carry_sleep_field(
+            device_wake_at_ms
+                .or_else(|| sanitize_event_ms(payload.wake_at_ms, recv_ms))
+                .or(leave_bed_at_ms),
+            collector.sleep_wake_at_ms,
+            starts_new_window,
+        )
     } else {
         None
     };
-    let duration_minutes = payload.duration_minutes.filter(|value| *value > 0);
+    let duration_minutes = carry_sleep_field(
+        payload.duration_minutes.filter(|value| *value > 0),
+        collector.sleep_duration_minutes,
+        starts_new_window,
+    );
     let sleep_segments_json = payload
         .segments
         .map(|segments| sanitize_sleep_segments(segments, recv_ms))
-        .map(|segments| {
+        .and_then(|segments| {
             if segments.is_empty() {
                 None
             } else {
                 serde_json::to_string(&segments).ok()
             }
-        })
-        .flatten();
-    let segments_changed = sleep_segments_json
-        .as_ref()
-        .is_some_and(|segments| collector.sleep_segments_json.as_ref() != Some(segments));
+        });
+    let next_segments_json = carry_sleep_field(
+        sleep_segments_json,
+        collector.sleep_segments_json.clone(),
+        starts_new_window,
+    );
+    let segments_changed = collector.sleep_segments_json != next_segments_json;
     let changed = collector.sleep_state.as_deref() != Some(state)
         || collector.sleep_observed_at_ms != Some(observed_at_ms)
         || collector.sleep_bed_at_ms != bed_at_ms
@@ -2092,11 +2128,21 @@ fn apply_sleep_status(
     collector.sleep_leave_bed_at_ms = leave_bed_at_ms;
     collector.sleep_device_wake_at_ms = device_wake_at_ms;
     collector.sleep_duration_minutes = duration_minutes;
-    if sleep_segments_json.is_some() {
-        collector.sleep_segments_json = sleep_segments_json;
-    }
+    collector.sleep_segments_json = next_segments_json;
     collector.sleep_updated_at_ms = Some(recv_ms);
     changed
+}
+
+fn carry_sleep_field<T>(
+    next: Option<T>,
+    existing: Option<T>,
+    starts_new_window: bool,
+) -> Option<T> {
+    if next.is_some() || starts_new_window {
+        next
+    } else {
+        existing
+    }
 }
 
 fn normalize_sleep_state(state: &str) -> Option<&'static str> {
@@ -3164,6 +3210,112 @@ mod tests {
         assert_eq!(sleep.wake_at_ms, Some(current_ms - 60_000));
         assert_eq!(sleep.duration_minutes, Some(34));
         assert_eq!(sleep.segments.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[tokio::test]
+    async fn sleep_window_transition_clears_previous_report_and_keeps_it_otherwise() {
+        let app = test_app().await;
+        let session = create_test_session(app.clone()).await;
+        let current_ms = now_ms();
+        let batch = |seq: u64, sleep: SleepStatusPayload| BatchPayload {
+            schema: 1,
+            collector_id: session.collector_id.clone(),
+            seq,
+            sent_at_ms: current_ms,
+            display_name: Some("Allen".to_string()),
+            device_model: Some("Mi Band".to_string()),
+            samples: vec![],
+            ble: None,
+            sleep: Some(sleep),
+        };
+        let status_only = |observed_at_ms: i64| SleepStatusPayload {
+            state: "asleep".to_string(),
+            observed_at_ms: Some(observed_at_ms),
+            bed_at_ms: None,
+            sleep_at_ms: None,
+            wake_at_ms: None,
+            go_bed_at_ms: None,
+            device_bed_at_ms: None,
+            leave_bed_at_ms: None,
+            device_wake_at_ms: None,
+            source: Some("test".to_string()),
+            stable: Some(false),
+            duration_minutes: None,
+            segments: None,
+        };
+
+        let report = SleepStatusPayload {
+            state: "awake".to_string(),
+            observed_at_ms: Some(current_ms),
+            bed_at_ms: Some(current_ms - 8 * 3_600_000),
+            sleep_at_ms: Some(current_ms - 7 * 3_600_000),
+            wake_at_ms: Some(current_ms - 60_000),
+            go_bed_at_ms: Some(current_ms - 8 * 3_600_000),
+            device_bed_at_ms: Some(current_ms - 7 * 3_600_000),
+            leave_bed_at_ms: Some(current_ms - 30_000),
+            device_wake_at_ms: Some(current_ms - 60_000),
+            source: Some("test".to_string()),
+            stable: Some(true),
+            duration_minutes: Some(420),
+            segments: Some(vec![SleepSegmentPayload {
+                bed_at_ms: Some(current_ms - 7 * 3_600_000),
+                wake_at_ms: Some(current_ms - 60_000),
+                device_bed_at_ms: Some(current_ms - 7 * 3_600_000),
+                device_wake_at_ms: Some(current_ms - 60_000),
+                duration_minutes: Some(420),
+                deep_minutes: None,
+                light_minutes: None,
+                rem_minutes: None,
+                awake_minutes: None,
+                awake_count: None,
+                score: None,
+            }]),
+        };
+        post_batch(app.clone(), &session, &batch(1, report)).await;
+        let sleep = lobby_sleep(app.clone()).await;
+        assert_eq!(sleep.segments.as_ref().map(Vec::len), Some(1));
+
+        post_batch(
+            app.clone(),
+            &session,
+            &batch(2, status_only(current_ms + 60_000)),
+        )
+        .await;
+        let sleep = lobby_sleep(app.clone()).await;
+        assert_eq!(sleep.state, "asleep");
+        assert_eq!(sleep.segments, None);
+        assert_eq!(sleep.bed_at_ms, None);
+        assert_eq!(sleep.go_bed_at_ms, None);
+        assert_eq!(sleep.device_bed_at_ms, None);
+        assert_eq!(sleep.wake_at_ms, None);
+        assert_eq!(sleep.duration_minutes, None);
+
+        let raw = SleepStatusPayload {
+            go_bed_at_ms: Some(current_ms - 30 * 60_000),
+            device_bed_at_ms: Some(current_ms - 25 * 60_000),
+            device_wake_at_ms: Some(current_ms - 1_000),
+            duration_minutes: Some(1),
+            ..status_only(current_ms + 120_000)
+        };
+        post_batch(app.clone(), &session, &batch(3, raw)).await;
+        let sleep = lobby_sleep(app.clone()).await;
+        assert_eq!(sleep.segments, None);
+        assert_eq!(sleep.go_bed_at_ms, Some(current_ms - 30 * 60_000));
+
+        post_batch(
+            app.clone(),
+            &session,
+            &batch(4, status_only(current_ms + 180_000)),
+        )
+        .await;
+        let sleep = lobby_sleep(app).await;
+        assert_eq!(sleep.state, "asleep");
+        assert_eq!(sleep.go_bed_at_ms, Some(current_ms - 30 * 60_000));
+        assert_eq!(sleep.device_bed_at_ms, Some(current_ms - 25 * 60_000));
+        assert_eq!(sleep.sleep_at_ms, Some(current_ms - 25 * 60_000));
+        assert_eq!(sleep.device_wake_at_ms, Some(current_ms - 1_000));
+        assert_eq!(sleep.duration_minutes, Some(1));
+        assert_eq!(sleep.segments, None);
     }
 
     #[tokio::test]
