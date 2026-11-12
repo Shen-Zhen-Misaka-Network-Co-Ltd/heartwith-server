@@ -47,9 +47,29 @@ const MAX_BODY_BYTES: usize = 128 * 1024;
 #[derive(Clone)]
 struct AppState {
     inner: Arc<RwLock<Store>>,
-    collector_write_lock: Arc<Mutex<()>>,
+    /// Serializes session creation (display-name claims) only.
+    session_lock: Arc<Mutex<()>>,
+    /// One writer per collector, so collectors no longer wait on each other's database I/O.
+    collector_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     events: broadcast::Sender<LobbyEvent>,
     db: Db,
+}
+
+impl AppState {
+    fn collector_lock(&self, collector_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .collector_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks
+            .entry(collector_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+}
+
+fn new_collector_token() -> String {
+    Uuid::new_v4().as_hyphenated().to_string() + "." + &Uuid::new_v4().simple().to_string()
 }
 
 #[derive(Default)]
@@ -1545,7 +1565,8 @@ async fn app_with_database(database_url: &str) -> anyhow::Result<Router> {
     start_retention_sweeper(db.clone());
     let state = AppState {
         inner: Arc::new(RwLock::new(store)),
-        collector_write_lock: Arc::new(Mutex::new(())),
+        session_lock: Arc::new(Mutex::new(())),
+        collector_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         events,
         db,
     };
@@ -1657,23 +1678,32 @@ async fn create_session(
     headers: HeaderMap,
     Json(request): Json<SessionRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
-    let _collector_write_guard = state.collector_write_lock.lock().await;
+    let _session_guard = state.session_lock.lock().await;
     let display_name = truncate(&request.display_name, 80);
     let device_model = truncate(&request.device_model, 80);
     let client_platform = truncate(&request.client_platform, 32);
     let app_version = truncate(&request.app_version, 32);
     let collector_id = format!("col_{}", Uuid::new_v4().simple());
-    let token =
-        Uuid::new_v4().as_hyphenated().to_string() + "." + &Uuid::new_v4().simple().to_string();
+    let token = new_collector_token();
     let base_url = public_base_url(&headers);
-    let mut store = state.inner.write().await;
-
-    if let Some(existing_id) = store
+    let existing_id = state
+        .inner
+        .read()
+        .await
         .collectors
         .values()
         .find(|collector| collector.display_name == display_name)
-        .map(|collector| collector.collector_id.clone())
-    {
+        .map(|collector| collector.collector_id.clone());
+    // Ingest updates a collector by clone-modify-insert under its own lock; hold the same
+    // lock here so a concurrent batch cannot overwrite these session fields.
+    let existing_lock = existing_id.as_deref().map(|id| state.collector_lock(id));
+    let _existing_guard = match &existing_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    let mut store = state.inner.write().await;
+
+    if let Some(existing_id) = existing_id {
         let Some(updated_collector) = store.collectors.get_mut(&existing_id).map(|collector| {
             collector.device_model = device_model;
             collector._client_platform = client_platform;
@@ -1689,9 +1719,7 @@ async fn create_session(
             .get(&existing_id)
             .cloned()
             .unwrap_or_else(|| {
-                let token = Uuid::new_v4().as_hyphenated().to_string()
-                    + "."
-                    + &Uuid::new_v4().simple().to_string();
+                let token = new_collector_token();
                 store.tokens.insert(token.clone(), existing_id.clone());
                 store
                     .collector_tokens
@@ -1777,7 +1805,12 @@ async fn ingest_batch(
         return Err(ApiError::BadRequest("unsupported schema"));
     }
 
-    let collector_write_guard = state.collector_write_lock.lock().await;
+    // Authenticate before creating a lock entry so unknown ids cannot grow the lock map.
+    if state.inner.read().await.tokens.get(token) != Some(&payload.collector_id) {
+        return Err(ApiError::Unauthorized);
+    }
+    let collector_lock = state.collector_lock(&payload.collector_id);
+    let collector_write_guard = collector_lock.lock().await;
     let payload_seq = payload.seq;
     let mut event_display_name = None;
     let mut persist_collector = None;
