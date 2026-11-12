@@ -1629,15 +1629,19 @@ fn web_dir() -> PathBuf {
         }
     }
 
-    let production = PathBuf::from("clients/heartwith-web/build/dist/wasmJs/productionExecutable");
-    if production.exists() {
-        return production;
+    let dist = PathBuf::from("clients/heartwith-web/dist");
+    if dist.exists() {
+        return dist;
     }
 
-    let development =
-        PathBuf::from("clients/heartwith-web/build/kotlin-webpack/wasmJs/developmentExecutable");
-    if development.exists() {
-        return development;
+    let sibling_dist = PathBuf::from("../heartwith-web/clients/heartwith-web/dist");
+    if sibling_dist.exists() {
+        return sibling_dist;
+    }
+
+    let legacy = PathBuf::from("clients/heartwith-web/build/dist/wasmJs/productionExecutable");
+    if legacy.exists() {
+        return legacy;
     }
 
     let web = PathBuf::from("web");
