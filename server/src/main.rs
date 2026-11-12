@@ -68,6 +68,7 @@ impl AppState {
     }
 }
 
+const COLLECTOR_SEQ_TTL_MS: i64 = 2 * 24 * 60 * 60_000;
 /// Clients that number batches by wall-clock time use seqs at or above this value. They are
 /// unique across processes and restarts, so they survive session re-creation; small legacy
 /// counters restart at 1 and must be forgotten when a session is re-created.
@@ -482,6 +483,11 @@ impl Db {
         )
         .execute(pool)
         .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_collector_seqs_seen ON collector_seqs(seen_at_ms)",
+        )
+        .execute(pool)
+        .await?;
         Ok(())
     }
 
@@ -607,6 +613,11 @@ impl Db {
         .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_rollups_collector_bucket ON heart_rate_rollups(collector_id, bucket_ms)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_collector_seqs_seen ON collector_seqs(seen_at_ms)",
         )
         .execute(pool)
         .await?;
@@ -741,6 +752,10 @@ impl Db {
                     .bind(current_ms - ROLLUP_TTL_MS)
                     .execute(pool)
                     .await?;
+                sqlx::query("DELETE FROM collector_seqs WHERE seen_at_ms < ?")
+                    .bind(current_ms - COLLECTOR_SEQ_TTL_MS)
+                    .execute(pool)
+                    .await?;
             }
             DbPool::Postgres(pool) => {
                 if !self.native_raw_retention {
@@ -751,6 +766,10 @@ impl Db {
                 }
                 sqlx::query("DELETE FROM heart_rate_rollups WHERE bucket_ms < $1")
                     .bind(current_ms - ROLLUP_TTL_MS)
+                    .execute(pool)
+                    .await?;
+                sqlx::query("DELETE FROM collector_seqs WHERE seen_at_ms < $1")
+                    .bind(current_ms - COLLECTOR_SEQ_TTL_MS)
                     .execute(pool)
                     .await?;
                 if self.native_raw_retention {
